@@ -37,6 +37,11 @@ def _peer_access() -> bool:
 
 
 @functools.cache
+def _sm90() -> bool:
+    return torch.cuda.get_device_capability(0) >= (9, 0)
+
+
+@functools.cache
 def _fabric_handles() -> bool:
     # Create, export, and import a fabric handle on GPU 0, as PyTorch's
     # isFabricSupported does.
@@ -74,6 +79,7 @@ def _fabric_handles() -> bool:
 _PROBES = {
     "peer_access": (_peer_access, "requires peer access between the GPUs"),
     "fabric": (_fabric_handles, "requires usable CUDA fabric handles"),
+    "sm90": (_sm90, "requires compute capability 9.0+"),
 }
 
 

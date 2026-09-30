@@ -42,13 +42,13 @@ def _unfrozen_signal_pad(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.cuda, "device", _fake_cuda_device)
 
 
-def test_buffer_offset_matches_signal_pad_rounding() -> None:
-    # buffer_offset is the signal-pad size rounded up to the 128-B alignment.
-    assert sm.buffer_offset() == sm._round_up(
-        sm.signal_pad_bytes(), sm.SIGNAL_PAD_ALIGNMENT
-    )
-    # The torch default pad (32 * 72 * 4 = 9216) is already 128-aligned.
-    assert sm.buffer_offset() == sm.signal_pad_bytes()
+def test_front_region_matches_torch() -> None:
+    # [signal pad | barrier state]: three units of half the pad, each rounded up
+    # to 128 bytes; the state is the last unit.
+    pad = sm.signal_pad_bytes()
+    unit = sm._round_up((pad + 1) // 2, sm.SIGNAL_PAD_ALIGNMENT)
+    assert sm.buffer_offset() == 3 * unit == 13824
+    assert sm.barrier_state_offset() == 2 * unit >= pad
 
 
 def test_signal_pad_env_rejects_nonpositive() -> None:
@@ -273,10 +273,10 @@ def test_signal_pad_size_is_fixed_at_first_alloc(
     sm.set_signal_pad_size(256)
     assert sm._SIGNAL_PAD_ENV not in os.environ
     allocator, buf = _allocator_with_one_alloc(monkeypatch)
-    assert buf == 0x100000 + 256
+    assert buf == 0x100000 + 384
 
     monkeypatch.setenv(sm._SIGNAL_PAD_ENV, "512")
-    assert sm.buffer_offset() == 256
+    assert sm.buffer_offset() == 384
     rec, o = allocator.find_covering(buf + 64)
     assert rec is not None and o == 64
     with pytest.raises(RuntimeError):

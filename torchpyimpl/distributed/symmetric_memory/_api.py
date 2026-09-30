@@ -13,9 +13,15 @@ import torch
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import GroupName
 
-from torchpyimpl.distributed.symmetric_memory import _mempool, _signal, _symm_mem
+from torchpyimpl.distributed.symmetric_memory import (
+    _mempool,
+    _multimem,
+    _signal,
+    _symm_mem,
+)
 from torchpyimpl.distributed.symmetric_memory._comm import get_group_info, GroupInfo
 from torchpyimpl.distributed.symmetric_memory._symm_mem import (
+    barrier_state_offset,
     signal_pad_bytes,
     signal_pad_slots,
 )
@@ -231,7 +237,7 @@ def has_multicast_support(handle: _symm_mem.SymmMemHandle) -> bool:
     comparing ``multicast_ptr`` yourself.
 
     The pointer it guards is addressable only through ``multimem.*``
-    instructions."""
+    instructions; see :mod:`torchpyimpl.distributed.symmetric_memory._multimem`."""
     return handle.multicast_ptr != 0
 
 
@@ -261,19 +267,31 @@ def _check_signal_args(
 def barrier(
     handle: _symm_mem.SymmMemHandle, channel: int = 0, timeout_ms: int | None = None
 ) -> None:
-    """All-to-all signal-pad barrier on ``channel``. ``timeout_ms=None`` uses
-    the rendezvous group's timeout (unbounded if it has none); ``0`` is
-    unbounded."""
+    """Barrier across the handle's ranks on ``channel``: the multicast barrier
+    when the allocation has a multicast signal pad, otherwise the all-to-all
+    CAS barrier. ``timeout_ms=None`` uses the rendezvous group's timeout
+    (unbounded if it has none); ``0`` is unbounded."""
     if handle.world_size <= 1:
         return
     _check_signal_args(handle, handle.rank, channel, "barrier")
+    timeout = _resolve_timeout(handle, timeout_ms)
     with torch.cuda.device(_handle_device(handle)):
+        if handle.multicast_signal_pad_ptr:
+            state = barrier_state_offset()
+            _multimem.barrier(
+                handle.multicast_signal_pad_ptr + state,
+                handle.signal_pad_ptr + state,
+                handle.world_size,
+                channel,
+                timeout,
+            )
+            return
         _signal.barrier(
             handle.signal_pad_ptrs_tensor,
             handle.rank,
             handle.world_size,
             channel,
-            _resolve_timeout(handle, timeout_ms),
+            timeout,
         )
 
 

@@ -32,8 +32,9 @@ outlined on that page and do not file a public issue.
 * 88 character line length.
 * Tests that need GPUs are marked `@pytest.mark.gpu` or `@pytest.mark.multi_gpu`.
 * Tests that need specific hardware also carry `@pytest.mark.peer_access` (GPU
-  peer access, e.g. NVLink) or `@pytest.mark.fabric` (CUDA fabric handles).
-  They are skipped when a probe finds the hardware missing.
+  peer access, e.g. NVLink), `@pytest.mark.fabric` (CUDA fabric handles), or
+  `@pytest.mark.sm90` (compute capability 9.0+). They are skipped when a probe
+  finds the hardware missing.
 
 ## License
 By contributing to torchpyimpl, you agree that your contributions will be

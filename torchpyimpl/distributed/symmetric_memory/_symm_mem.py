@@ -77,10 +77,20 @@ def signal_pad_slots() -> int:
 
 def buffer_offset() -> int:
     """Constant byte offset from an allocation's base (== signal-pad base) to its
-    data buffer: ``round_up(signal_pad_bytes, 128)``. A process-global constant
-    once allocations begin (the pad size is frozen), which is what makes
+    data buffer. The front region is [signal pad | barrier state], as in torch:
+    the pad takes two units of half its size and the multimem barrier's state
+    one, each unit rounded up to 128 bytes. A process-global constant once
+    allocations begin (the pad size is frozen), which is what makes
     ``base + buffer_offset`` a sound O(1) recovery of the data pointer."""
-    return _round_up(signal_pad_bytes(), SIGNAL_PAD_ALIGNMENT)
+    return 3 * _round_up((signal_pad_bytes() + 1) // 2, SIGNAL_PAD_ALIGNMENT)
+
+
+def barrier_state_offset() -> int:
+    """Byte offset from a signal pad to the multimem barrier's state: one
+    arrival counter per channel, apart from the pad, so a pending signal is
+    never counted as an arrival. Groups of two or more ranks have at most
+    ``signal_pad_bytes() // 8`` channels, so the state holds every counter."""
+    return buffer_offset() // 3 * 2
 
 
 def set_signal_pad_size(size: int) -> None:
