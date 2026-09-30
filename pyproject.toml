@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=78"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchpyimpl"
+dynamic = ["version"]
+description = "Pure-Python implementations of PyTorch GPU and distributed subsystems"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.15.0.dev0",
+    "triton; sys_platform == 'linux'",
+    "cuda-python>=13.3,<14",
+    "nccl4py>=0.5",
+    "nvidia-cutlass-dsl==4.6.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "lintrunner",
+    # Keep in sync with the version in .pyre_configuration.
+    "pyre-check-nightly==0.0.101749035478",
+]
+
+[project.urls]
+Repository = "https://github.com/meta-pytorch/torchpyimpl"
+
+[tool.setuptools.dynamic]
+version = { file = "version.txt" }
+
+[tool.setuptools.packages.find]
+include = ["torchpyimpl*"]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+prerelease = "if-necessary-or-explicit"
+
+[[tool.uv.index]]
+name = "pytorch-nightly-cu132"
+url = "https://download.pytorch.org/whl/nightly/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-nightly-cu132" }
+triton = { index = "pytorch-nightly-cu132" }
+
+[tool.ufmt]
+formatter = "ruff-api"
+sorter = "usort"
+
+[tool.usort]
+first_party_detection = false
+
+[tool.ruff]
+line-length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA GPU",
+    "multi_gpu: requires two or more CUDA GPUs",
+]

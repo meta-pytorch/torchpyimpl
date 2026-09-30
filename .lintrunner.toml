@@ -1,0 +1,37 @@
+[[linter]]
+code = 'PYRE'
+include_patterns = [
+    "torchpyimpl/**/*.py",
+    "torchpyimpl/**/*.pyi",
+]
+command = [
+    'python3',
+    'tools/linter/adapters/pyre_linter.py',
+    '--',
+    '@{{PATHSFILE}}'
+]
+init_command = [
+    'bash',
+    'scripts/setup_pyre.sh',
+    '--dry-run={{DRYRUN}}',
+]
+is_formatter = false
+
+[[linter]]
+code = 'UFMT'
+include_patterns = [
+    "torchpyimpl/**/*.py",
+    "torchpyimpl/**/*.pyi",
+    "tests/**/*.py",
+    "tools/**/*.py",
+    "conftest.py",
+]
+command = [
+    'uv',
+    'run',
+    '--script',
+    'tools/linter/adapters/ufmt_linter.py',
+    '--',
+    '@{{PATHSFILE}}'
+]
+is_formatter = true
