@@ -1,0 +1,12 @@
+{
+  "exclude": [
+    ".*/build/.*",
+    ".*/docs/.*"
+  ],
+  "site_package_search_strategy": "all",
+  "source_directories": [
+    "torchpyimpl"
+  ],
+  "strict": false,
+  "version": "0.0.101749035478"
+}
