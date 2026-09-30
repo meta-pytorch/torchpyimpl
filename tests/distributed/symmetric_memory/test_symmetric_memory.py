@@ -254,6 +254,46 @@ def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> 
         mc_flags: list[Any] = [None] * world_size
         dist.all_gather_object(mc_flags, symm.has_multicast_support(hdl), group=pg)
 
+        # Fence: the sum above is only correct while every rank still holds
+        # rank+1, so no rank may start stamping until all have summed.
+        dist.barrier(group=pg)
+
+        # Signal-pad barrier: stamp our buffer, barrier, then every peer's stamp
+        # must be visible.
+        symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32).fill_(float(rank + 100))
+        torch.cuda.synchronize(device)
+        hdl.barrier()
+        stamps = [
+            float(symm.get_buffer(hdl, p, (1,), torch.float32)[0].item())
+            for p in range(world_size)
+        ]
+        # Second round, with another device current: slots must have been left
+        # reusable, and the kernel must run on the handle's device.
+        with torch.cuda.device((rank + 1) % torch.cuda.device_count()):
+            hdl.barrier()
+        torch.cuda.synchronize(device)
+
+        # put_signal / wait_signal ring on channel 1: after the send lands, the
+        # predecessor's slot reads 1, and wait_signal resets it to 0.
+        succ, pred = (rank + 1) % world_size, (rank - 1) % world_size
+        slot = 1 * world_size + pred  # channel * world_size + src
+        hdl.put_signal(succ, channel=1)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=pg)
+        own_pad = symm.get_signal_pad(hdl, rank)
+        torch.cuda.synchronize(device)
+        signal_raised = int(own_pad[slot].item()) == 1
+        hdl.wait_signal(pred, channel=1)
+        torch.cuda.synchronize(device)
+        signal_cleared = int(own_pad[slot].item()) == 0
+        # Without this fence the predecessor can start round 2 and re-raise the
+        # slot before it has been read.
+        dist.barrier(group=pg)
+        hdl.put_signal(succ, channel=1)
+        hdl.wait_signal(pred, channel=1)
+        torch.cuda.synchronize(device)
+        pad_drained = bool(torch.all(symm.get_signal_pad(hdl, rank) == 0).item())
+
         report: dict[str, Any] = {
             "rank": rank,
             "transport": _cuda_ipc.get_transport(rank).value,
@@ -272,6 +312,11 @@ def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> 
             "sum_first": float(acc[0].item()),
             "sum_all_equal": bool(torch.all(acc == acc[0]).item()),
             "multicast_agreed": len(set(mc_flags)) == 1,
+            "stamps": stamps,
+            "barrier_ok": stamps == [float(p + 100) for p in range(world_size)],
+            "signal_raised": signal_raised,
+            "signal_cleared": signal_cleared,
+            "pad_drained": pad_drained,
         }
 
         dist.barrier(group=pg)
@@ -319,6 +364,12 @@ def test_symm_mem_mempool(transport: str, tmp_path: pathlib.Path) -> None:
             f"rank {rank}: cross-rank sum = {r['sum_first']}, want {expected_sum}"
         )
         assert r["multicast_agreed"], f"rank {rank}: ranks disagree on multicast"
+        assert r["barrier_ok"], (
+            f"rank {rank}: peers' stamps not all visible after barrier: {r['stamps']}"
+        )
+        assert r["signal_raised"], f"rank {rank}: predecessor's signal never landed"
+        assert r["signal_cleared"], f"rank {rank}: wait_signal did not reset the slot"
+        assert r["pad_drained"], f"rank {rank}: signal pad not back to zero"
         assert r["peer_alloc_infos_after_free"] == 0, (
             f"rank {rank}: peer state still registered after free_pool"
         )

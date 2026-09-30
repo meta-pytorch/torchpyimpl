@@ -196,6 +196,27 @@ class SymmMemHandle:
     comm_ptr: int  # communicator pointer or synthetic group id used for rendezvous
     data_ptr: int = 0  # the pointer passed to rendezvous; the cache key
 
+    # Signal-pad operations as handle methods, with torch's argument order.
+    # They forward to _api, which imports this module.
+    def barrier(self, channel: int = 0, timeout_ms: int | None = None) -> None:
+        from torchpyimpl.distributed.symmetric_memory import _api
+
+        _api.barrier(self, channel, timeout_ms)
+
+    def put_signal(
+        self, dst_rank: int, channel: int = 0, timeout_ms: int | None = None
+    ) -> None:
+        from torchpyimpl.distributed.symmetric_memory import _api
+
+        _api.put_signal(self, dst_rank, channel, timeout_ms)
+
+    def wait_signal(
+        self, src_rank: int, channel: int = 0, timeout_ms: int | None = None
+    ) -> None:
+        from torchpyimpl.distributed.symmetric_memory import _api
+
+        _api.wait_signal(self, src_rank, channel, timeout_ms)
+
 
 # === the shared, backend-agnostic allocator ===================================
 
