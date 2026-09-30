@@ -323,6 +323,20 @@ def test_rendezvous_rejects_size_outside_allocation(
     assert h.size == _NBYTES - 64
 
 
+def test_rendezvous_drops_peer_state_of_a_dead_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator, buf = _allocator_with_one_alloc(monkeypatch)
+    device = torch.device("cpu")
+    h1 = allocator.rendezvous(buf, 11, 0, 1, device)
+    monkeypatch.setattr(allocator, "peers_alive", lambda _pai: False)
+
+    h2 = allocator.rendezvous(buf, 11, 0, 1, device)
+
+    assert h2 is not h1
+    assert allocator.get_cached_handle(buf, 11) is h2
+
+
 def test_rendezvous_rejects_uncovered_ptr(monkeypatch: pytest.MonkeyPatch) -> None:
     allocator, buf = _allocator_with_one_alloc(monkeypatch)
     with pytest.raises(KeyError, match="no symmetric allocation covers"):

@@ -31,8 +31,11 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def set_backend(name: str) -> None:
-    """Select the symmetric-memory backend. Available: ``"CUDA"`` (default),
-    CUDA VMM + IPC over fabric handles or POSIX fds.
+    """Select the symmetric-memory backend:
+
+    * ``"CUDA"`` (default) — CUDA VMM + IPC over fabric handles or POSIX fds.
+    * ``"NCCL"`` — ``ncclMemAlloc`` + ``ncclCommWindowRegister`` symmetric
+      windows on the process group's communicator.
 
     Must be called before the first symmetric allocation."""
     _symm_mem.set_active_backend(name)
@@ -129,11 +132,14 @@ def _resolve_timeout(handle: _symm_mem.SymmMemHandle, timeout_ms: int | None) ->
     return ms
 
 
-def free_pool(device: torch.device) -> _mempool.FreePoolStatus:
-    """Free the symmetric pool of ``device``. Each rank decides the status
-    alone, so the caller must agree on it across ranks. Handles from earlier
-    rendezvous calls are not valid after the pool is freed."""
-    return _mempool.free_pool(device)
+def free_pool(
+    device: torch.device, group: dist.ProcessGroup | None = None
+) -> _mempool.FreePoolStatus:
+    """Free the symmetric pool of ``device``. With ``group``, the ranks agree
+    before the teardown (see :func:`_mempool.free_pool`); without it, each rank
+    decides alone. Handles from earlier rendezvous calls are not valid after
+    the pool is freed."""
+    return _mempool.free_pool(device, group)
 
 
 # === handle accessors =========================================================

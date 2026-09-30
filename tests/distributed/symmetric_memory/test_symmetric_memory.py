@@ -214,14 +214,22 @@ def test_standalone_rendezvous_cache_and_free(
 # ── MemPool API ───────────────────────────────────────────────────────────────
 
 
-def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> None:
-    # Must be set before the first allocation: cuMemCreate bakes the handle type
-    # into the block.
-    os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
-    _cuda_ipc.reset_transport()
+def _worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    out: str,
+    backend: str,
+    transport: str | None,
+) -> None:
+    if transport is not None:
+        # Must be set before the first allocation: cuMemCreate bakes the handle
+        # type into the block.
+        os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
+        _cuda_ipc.reset_transport()
     device = _init_dist(rank, world_size, port)
     try:
-        symm.set_backend("CUDA")
+        symm.set_backend(backend)
         pg = dist.new_group(ranks=list(range(world_size)))
 
         tensors = [
@@ -296,7 +304,10 @@ def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> 
 
         report: dict[str, Any] = {
             "rank": rank,
-            "transport": _cuda_ipc.get_transport(rank).value,
+            "backend": sm.get_active_backend(),
+            "transport": (
+                _cuda_ipc.get_transport(rank).value if backend == "CUDA" else None
+            ),
             "buffer_ptrs_len": [len(h.buffer_ptrs) for h in handles],
             "all_ptrs_nonzero": all(
                 all(p != 0 for p in h.buffer_ptrs) for h in handles
@@ -337,18 +348,28 @@ def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> 
 @pytest.mark.multi_gpu
 @pytest.mark.peer_access
 @pytest.mark.parametrize(
-    "transport", [pytest.param("fabric", marks=pytest.mark.fabric), "fd"]
+    ("backend", "transport"),
+    [
+        pytest.param("CUDA", "fabric", marks=pytest.mark.fabric),
+        ("CUDA", "fd"),
+        ("NCCL", None),
+    ],
 )
-def test_symm_mem_mempool(transport: str, tmp_path: pathlib.Path) -> None:
+def test_symm_mem_mempool(
+    backend: str, transport: str | None, tmp_path: pathlib.Path
+) -> None:
     if transport == "fd" and not _cuda_ipc.cu_device_supports_posix_fd(0):
         pytest.skip("no POSIX-fd handle support on this device")
     world_size = min(torch.cuda.device_count(), 8)
-    reports = _spawn(_worker, world_size, str(tmp_path / "reports.json"), transport)
+    reports = _spawn(
+        _worker, world_size, str(tmp_path / "reports.json"), backend, transport
+    )
 
     expected_sum = float(sum(range(1, world_size + 1)))
     assert len(reports) == world_size
     for r in reports:
         rank = r["rank"]
+        assert r["backend"] == backend, rank
         assert r["transport"] == transport, rank
         assert all(n == world_size for n in r["buffer_ptrs_len"]), rank
         assert r["all_ptrs_nonzero"], rank

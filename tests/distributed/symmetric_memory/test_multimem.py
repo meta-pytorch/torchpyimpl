@@ -106,7 +106,9 @@ def _ordering_holds(
     return seen == [stamp + p for p in range(world_size)]
 
 
-def _worker(rank: int, world_size: int, master_port: int, result_path: str) -> None:
+def _worker(
+    rank: int, world_size: int, master_port: int, result_path: str, backend: str
+) -> None:
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(master_port),
@@ -120,6 +122,7 @@ def _worker(rank: int, world_size: int, master_port: int, result_path: str) -> N
         backend="nccl", rank=rank, world_size=world_size, device_id=device
     )
     try:
+        symm.set_backend(backend)
         pg = dist.new_group(ranks=list(range(world_size)))
         buf = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
         hdl = symm.rendezvous(buf, pg)
@@ -216,12 +219,15 @@ def _gather(report: dict[str, Any], pg: Any, world_size: int, result_path: str) 
 
 @pytest.mark.multi_gpu
 @pytest.mark.peer_access
-def test_multimem_barrier_routing_and_fill(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("backend", ["CUDA", "NCCL"])
+def test_multimem_barrier_routing_and_fill(
+    backend: str, tmp_path: pathlib.Path
+) -> None:
     world_size = min(torch.cuda.device_count(), 8)
     result_path = str(tmp_path / "reports.json")
     mp.spawn(
         _worker,
-        args=(world_size, _free_port(), result_path),
+        args=(world_size, _free_port(), result_path, backend),
         nprocs=world_size,
         join=True,
     )

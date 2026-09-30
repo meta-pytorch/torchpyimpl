@@ -551,6 +551,16 @@ class SymmetricMemoryAllocatorBase:
                 f"0x{buffer_ptr:x}"
             )
 
+        with rec.reg_lock:
+            stale = rec.per_comm.get(comm_ptr)
+            if stale is not None and not self.peers_alive(stale):
+                # The peer state died with its group, and a new communicator
+                # can have the same address.
+                del rec.per_comm[comm_ptr]
+                with self._lock:
+                    for k in [k for k in rec.handles if k[1] == comm_ptr]:
+                        del rec.handles[k]
+
         key = (buffer_ptr, comm_ptr)
         with self._lock:
             cached = rec.handles.get(key)
@@ -665,13 +675,17 @@ class SymmetricMemoryAllocatorBase:
         Idempotent."""
         return CleanupStatus.CLEANED
 
+    def peers_alive(self, pai: _PeerAllocInfo) -> bool:
+        """False if the peer state is gone with its group (backend override)."""
+        return True
+
     def should_skip_cleanup(self, device: int) -> bool:
         return should_skip_cuda_cleanup(device)
 
 
 # === backend registry + standalone API ========================================
 
-_BACKENDS: tuple[str, ...] = ("CUDA",)
+_BACKENDS: tuple[str, ...] = ("CUDA", "NCCL")
 _active_backend: str = "CUDA"
 _allocators: dict[str, SymmetricMemoryAllocatorBase] = {}
 _allocators_lock: threading.Lock = threading.Lock()
@@ -686,6 +700,12 @@ def _build_allocator(name: str) -> SymmetricMemoryAllocatorBase:
         )
 
         return CUDAIPCAllocator()
+    if name == "NCCL":
+        from torchpyimpl.distributed.symmetric_memory.backends._nccl import (
+            NCCLAllocator,
+        )
+
+        return NCCLAllocator()
     raise ValueError(f"symmetric memory backends are {_BACKENDS}, got {name!r}")
 
 
@@ -766,7 +786,8 @@ def rendezvous(
 ) -> SymmMemHandle:
     """Collective. Build a :class:`SymmMemHandle` for ``buffer_ptr`` (raw-pointer
     entry point; the MemPool path calls the allocator directly). ``group`` is
-    required by the CUDA-IPC backend for the IPC-handle exchange."""
+    required by the CUDA-IPC backend for the IPC-handle exchange; the NCCL
+    backend uses ``comm_ptr``."""
     return get_allocator_instance().rendezvous(
         buffer_ptr, comm_ptr, rank, world_size, device, size=size, group=group
     )

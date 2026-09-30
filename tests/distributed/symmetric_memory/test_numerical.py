@@ -75,7 +75,9 @@ def _one_shot_all_reduce(
     return out
 
 
-def _worker(rank: int, world_size: int, master_port: int, result_path: str) -> None:
+def _worker(
+    rank: int, world_size: int, master_port: int, result_path: str, backend: str
+) -> None:
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(master_port),
@@ -89,6 +91,7 @@ def _worker(rank: int, world_size: int, master_port: int, result_path: str) -> N
         backend="nccl", rank=rank, world_size=world_size, device_id=device
     )
     try:
+        symm.set_backend(backend)
         pg = dist.new_group(ranks=list(range(world_size)))
 
         per_size: dict[str, Any] = {}
@@ -131,12 +134,15 @@ def _worker(rank: int, world_size: int, master_port: int, result_path: str) -> N
 
 @pytest.mark.multi_gpu
 @pytest.mark.peer_access
-def test_triton_oneshot_allreduce_numerical(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("backend", ["CUDA", "NCCL"])
+def test_triton_oneshot_allreduce_numerical(
+    backend: str, tmp_path: pathlib.Path
+) -> None:
     world_size = min(torch.cuda.device_count(), 8)
     result_path = str(tmp_path / "reports.json")
     mp.spawn(
         _worker,
-        args=(world_size, _free_port(), result_path),
+        args=(world_size, _free_port(), result_path, backend),
         nprocs=world_size,
         join=True,
     )
