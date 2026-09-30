@@ -241,4 +241,6 @@ testpaths = ["tests"]
 markers = [
     "gpu: requires a CUDA GPU",
     "multi_gpu: requires two or more CUDA GPUs",
+    "peer_access: requires peer access between the GPUs",
+    "fabric: requires usable CUDA fabric handles",
 ]

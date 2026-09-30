@@ -38,4 +38,4 @@ jobs:
         set -ex
         pip install uv
         uv sync --locked
-        uv run pytest tests/ -v
+        uv run pytest tests/ -v -rs

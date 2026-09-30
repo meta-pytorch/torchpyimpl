@@ -22,6 +22,7 @@ from enum import auto, Enum
 
 import torch
 
+from torchpyimpl.distributed.symmetric_memory import _allocator
 from torchpyimpl.distributed.symmetric_memory._cuda import (
     cu_memset_d8,
     should_skip_cuda_cleanup,
@@ -621,3 +622,124 @@ class SymmetricMemoryAllocatorBase:
 
     def should_skip_cleanup(self, device: int) -> bool:
         return should_skip_cuda_cleanup(device)
+
+
+# === backend registry + standalone API ========================================
+
+_BACKENDS: tuple[str, ...] = ("CUDA",)
+_active_backend: str = "CUDA"
+_allocators: dict[str, SymmetricMemoryAllocatorBase] = {}
+_allocators_lock: threading.Lock = threading.Lock()
+
+
+def _build_allocator(name: str) -> SymmetricMemoryAllocatorBase:
+    # Deferred: backends subclass SymmetricMemoryAllocatorBase, so a module-level
+    # import would be circular.
+    if name == "CUDA":
+        from torchpyimpl.distributed.symmetric_memory.backends._cuda_ipc import (
+            CUDAIPCAllocator,
+        )
+
+        return CUDAIPCAllocator()
+    raise ValueError(f"symmetric memory backends are {_BACKENDS}, got {name!r}")
+
+
+def get_allocator_instance() -> SymmetricMemoryAllocatorBase:
+    """The process-wide allocator for the active backend (shared by the MemPool
+    allocator callback and the standalone ``alloc``/``rendezvous`` path)."""
+    inst = _allocators.get(_active_backend)
+    if inst is not None:
+        return inst  # hot path: called per alloc/free from the MemPool callback
+    with _allocators_lock:
+        # Re-check under the lock. Two threads allocating on different devices
+        # race here (the caching allocator's device locks do not serialize
+        # them), and a second instance would split _records: blocks recorded in
+        # the discarded one are invisible to the survivor, so their free() is a
+        # silent no-op that leaks the peer state and its physical memory.
+        inst = _allocators.get(_active_backend)
+        if inst is None:
+            inst = _build_allocator(_active_backend)
+            _allocators[_active_backend] = inst
+    return inst
+
+
+def get_active_backend() -> str:
+    """The active symmetric-memory backend name."""
+    return _active_backend
+
+
+def set_active_backend(name: str) -> None:
+    """Switch the active backend. Must be called before the first allocation on
+    any backend — the choice is baked into every live allocation's memory."""
+    global _active_backend
+    if name not in _BACKENDS:
+        raise ValueError(f"symmetric memory backends are {_BACKENDS}, got {name!r}")
+    if name == _active_backend:
+        return
+    # _pending counts too: those records are drained by release_pending() on the
+    # allocator that owns them, but every drain path resolves the allocator
+    # through get_allocator_instance() — i.e. the *active* one. Switching away
+    # would strand the old backend's queued releases and physical memory.
+    live = [
+        n
+        for n, a in _allocators.items()
+        if a._records or a._pending or a._failed or a._unpublished_failed
+    ]
+    if live:
+        raise RuntimeError(
+            f"cannot switch symmetric-memory backend to {name!r}: allocations "
+            f"already exist on {live} (live, or freed and awaiting release). "
+            "Call set_backend before the first allocation."
+        )
+    _active_backend = name
+
+
+def alloc(size: int, device: torch.device | None = None) -> int:
+    """Allocate ``size`` bytes of symmetric memory (active backend); returns the
+    data ptr."""
+    return get_allocator_instance().alloc(size, device)
+
+
+def free(ptr: int) -> None:
+    """Free the allocation returned by :func:`alloc`.
+
+    Drains immediately: unlike the MemPool callback this runs on the caller's
+    thread, so it can do the peer teardown itself."""
+    allocator = get_allocator_instance()
+    allocator.free(ptr)
+    allocator.release_pending()
+
+
+def rendezvous(
+    buffer_ptr: int,
+    size: int,
+    comm_ptr: int,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    group: object | None = None,
+) -> SymmMemHandle:
+    """Collective. Build a :class:`SymmMemHandle` for ``buffer_ptr`` (raw-pointer
+    entry point; the MemPool path calls the allocator directly). ``group`` is
+    required by the CUDA-IPC backend for the IPC-handle exchange."""
+    return get_allocator_instance().rendezvous(
+        buffer_ptr, comm_ptr, rank, world_size, device, size=size, group=group
+    )
+
+
+def find_covering(ptr: int) -> tuple[AllocRecord | None, int]:
+    """Map ``ptr`` to its covering allocation and offset (O(1))."""
+    return get_allocator_instance().find_covering(ptr)
+
+
+def get_cached_handle(buffer_ptr: int, comm_ptr: int) -> SymmMemHandle | None:
+    """Return the cached handle for ``(buffer_ptr, comm_ptr)``, or ``None``."""
+    return get_allocator_instance().get_cached_handle(buffer_ptr, comm_ptr)
+
+
+def _cache_stats() -> dict[str, int]:
+    """Internal: cache occupancy counts (used by tests)."""
+    return get_allocator_instance().cache_stats()
+
+
+_allocator.set_backend_resolver(get_allocator_instance)

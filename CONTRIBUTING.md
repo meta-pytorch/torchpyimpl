@@ -31,6 +31,9 @@ outlined on that page and do not file a public issue.
   (ruff) and type checking (pyrefly) setup as PyTorch.
 * 88 character line length.
 * Tests that need GPUs are marked `@pytest.mark.gpu` or `@pytest.mark.multi_gpu`.
+* Tests that need specific hardware also carry `@pytest.mark.peer_access` (GPU
+  peer access, e.g. NVLink) or `@pytest.mark.fabric` (CUDA fabric handles).
+  They are skipped when a probe finds the hardware missing.
 
 ## License
 By contributing to torchpyimpl, you agree that your contributions will be
