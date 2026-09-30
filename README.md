@@ -21,6 +21,8 @@ on regular `torch.Tensor`s, and require no C++ build.
 |---|---|---|
 | Symmetric memory | `torchpyimpl.distributed.symmetric_memory` | In progress |
 
+Design notes: [`docs/symmetric_memory`](docs/symmetric_memory/README.md).
+
 ## Prerequisites
 
 - Python 3.12 through 3.14
