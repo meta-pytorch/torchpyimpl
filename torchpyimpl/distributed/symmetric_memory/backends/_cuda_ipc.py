@@ -117,6 +117,10 @@ def _driver_handle_type(kind: IpcHandleType) -> object:
     return _FABRIC if kind is IpcHandleType.FABRIC else _POSIX_FD
 
 
+# Device count used only to query the multicast granularity at allocation time.
+_MC_GRANULARITY_DEVICES: int = 2
+
+
 def _check(err: object, what: str) -> None:
     if err != driver.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"{what} failed: {err}")
@@ -179,11 +183,13 @@ def cu_device_supports_posix_fd(device: int) -> bool:
 
 def cu_map_handle(handle: object, size: int, device: int) -> int:
     """Reserve a VA range, map ``handle`` into it, grant this device RW access,
-    and return the mapped base pointer.
+    and return the mapped base pointer. Works for both a memory handle and a
+    multicast object handle.
 
     Owns exactly the VA reservation it makes: if the map fails, that reservation
     is released before re-raising, so a failed map cannot strand address space.
-    ``handle`` stays the caller's to release."""
+    ``handle`` stays the caller's to release — this is also the multicast path,
+    where the object outlives any one mapping."""
     err, reserved = driver.cuMemAddressReserve(size, 0, 0, 0)
     _check(err, "cuMemAddressReserve")
     base = int(reserved)
@@ -206,9 +212,12 @@ def cu_vmm_alloc(
     ``kind`` is baked into the block here (``requestedHandleTypes``): a block
     created for FABRIC cannot later be exported as a POSIX fd, or vice versa.
 
-    The size is rounded up to the driver's recommended allocation granularity.
-    ``mapped_size`` is what every rank must map, so it — not the caller's
-    request — is what peers reserve/map on import."""
+    The size is rounded up to the driver's recommended allocation granularity —
+    and, where multicast is supported, to the multicast granularity too, so the
+    block can later be bound to a multicast object (``cuMulticastBindMem`` needs
+    a size that is a multiple of the multicast granularity). ``mapped_size`` is
+    what every rank must map, so it — not the caller's request — is what peers
+    reserve/map on import."""
     _cuda._init()
     prop = _alloc_prop(device, kind)
     err, gran = driver.cuMemGetAllocationGranularity(
@@ -216,7 +225,17 @@ def cu_vmm_alloc(
         driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
     )
     _check(err, "cuMemGetAllocationGranularity")
-    size = _round_up(min_size, int(gran))
+    granularity = int(gran)
+    if cu_device_supports_multicast(device):
+        # The world size is not known until rendezvous, so the granularity is
+        # queried for _MC_GRANULARITY_DEVICES. It is device-count independent on
+        # current hardware, and if that ever stops holding the size is simply
+        # rejected at cuMulticastBindMem, which _init_multicast degrades to the
+        # peer-to-peer path rather than failing the rendezvous.
+        granularity = max(
+            granularity, cu_multicast_granularity(_MC_GRANULARITY_DEVICES, kind)
+        )
+    size = _round_up(min_size, granularity)
     err, handle = driver.cuMemCreate(size, prop, 0)
     _check(err, "cuMemCreate")
     try:
@@ -230,7 +249,7 @@ def cu_vmm_alloc(
 def cu_mem_export(
     handle: object, kind: IpcHandleType = IpcHandleType.FABRIC
 ) -> bytes | int:
-    """Export memory ``handle`` as a shareable
+    """Export ``handle`` (a memory or multicast object handle) as a shareable
     handle of ``kind``:
 
     * FABRIC → 64 ``bytes``, picklable, ships over ``dist.all_gather_object``.
@@ -248,7 +267,7 @@ def cu_mem_export(
 def cu_mem_import(
     raw: bytes | int, kind: IpcHandleType = IpcHandleType.FABRIC
 ) -> object:
-    """Import a peer's shareable memory handle. ``raw`` goes
+    """Import a peer's shareable handle (memory or multicast). ``raw`` goes
     straight to ``cuMemImportFromShareableHandle`` as the ``void*`` ``osHandle``
     — the raw 64 bytes for FABRIC, the fd (as an int) for POSIX_FD. The driver
     dups a POSIX fd internally, so the caller still owns and must close it."""
@@ -275,7 +294,9 @@ def cu_vmm_import_map(
 
 
 def cu_mem_unmap(base: int, size: int) -> bool:
-    """``cuMemUnmap`` the VA range and free the reservation.
+    """``cuMemUnmap`` the VA range and free the reservation. Kept separate from
+    the physical release so teardown can interleave a multicast unbind in
+    between (unbind must precede the physical release).
 
     Both steps run even if the first failed — teardown must not raise part-way
     and leak the rest — but each failure is logged rather than dropped, so a
@@ -306,7 +327,7 @@ def cu_mem_unmap(base: int, size: int) -> bool:
 
 
 def cu_mem_release(handle: object) -> bool:
-    """Release a physical memory handle. Logs rather than
+    """Release a physical memory / multicast object handle. Logs rather than
     raises: callers are teardown paths that must keep going."""
     try:
         (err,) = driver.cuMemRelease(handle)
@@ -326,6 +347,79 @@ def cu_vmm_free(base: int, size: int, handle: object) -> bool:
     return unmapped and released
 
 
+# === CUDA multicast (multimem) ================================================
+#
+# Rank 0 creates and exports the object; every rank imports it, adds its device,
+# binds its block, and maps it.
+
+_MULTICAST_ATTR: object = (
+    driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED
+)
+
+
+@functools.cache
+def cu_device_supports_multicast(device: int) -> bool:
+    """Whether ``device`` supports multicast objects (needed for the multimem /
+    LSA pointer)."""
+    _cuda._init()
+    err, val = driver.cuDeviceGetAttribute(_MULTICAST_ATTR, device)
+    return err == driver.CUresult.CUDA_SUCCESS and int(val) == 1
+
+
+def _multicast_prop(num_devices: int, size: int, kind: IpcHandleType) -> object:
+    prop = driver.CUmulticastObjectProp()
+    prop.numDevices = num_devices
+    prop.size = size
+    prop.handleTypes = _driver_handle_type(kind)
+    prop.flags = 0
+    return prop
+
+
+@functools.cache
+def cu_multicast_granularity(
+    num_devices: int, kind: IpcHandleType = IpcHandleType.FABRIC
+) -> int:
+    """Minimum granularity a multicast object — and the memory bound to it — must
+    be a multiple of."""
+    _cuda._init()
+    prop = _multicast_prop(num_devices, 0, kind)
+    err, gran = driver.cuMulticastGetGranularity(
+        prop, driver.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_MINIMUM
+    )
+    _check(err, "cuMulticastGetGranularity")
+    return int(gran)
+
+
+def cu_multicast_create(
+    size: int, num_devices: int, kind: IpcHandleType = IpcHandleType.FABRIC
+) -> object:
+    """Create a multicast object spanning ``num_devices`` (>= 2) of ``size``
+    bytes, exportable as ``kind``. Only one rank creates it; the others import
+    the handle it shares."""
+    _cuda._init()
+    prop = _multicast_prop(num_devices, size, kind)
+    err, mc = driver.cuMulticastCreate(prop)
+    _check(err, "cuMulticastCreate")
+    return mc
+
+
+def cu_multicast_add_device(mc: object, device: int) -> None:
+    (err,) = driver.cuMulticastAddDevice(mc, device)
+    _check(err, "cuMulticastAddDevice")
+
+
+def cu_multicast_bind_mem(mc: object, mem_handle: object, size: int) -> None:
+    """Bind ``mem_handle`` (this rank's physical block) into ``mc`` at offset 0."""
+    (err,) = driver.cuMulticastBindMem(mc, 0, mem_handle, 0, size, 0)
+    _check(err, "cuMulticastBindMem")
+
+
+def cu_multicast_unbind(mc: object, device: int, size: int) -> None:
+    """Unbind ``device``'s memory from ``mc`` (before the block is released)."""
+    (err,) = driver.cuMulticastUnbind(mc, device, 0, size)
+    _check(err, "cuMulticastUnbind")
+
+
 @dataclass
 class _CudaMapping:
     base: int  # mapped VA base (== signal-pad base, signal-pad-first)
@@ -335,12 +429,24 @@ class _CudaMapping:
 
 
 @dataclass
+class _CudaMulticast:
+    """The multicast object for one (allocation, group): the multimem mapping +
+    the handle to unbind/release at teardown."""
+
+    handle: object  # the multicast object handle (owns the multimem)
+    addr: int  # mapped multicast (multimem) VA base
+    size: int
+    device: int
+
+
+@dataclass
 class _CudaPeerState:
     """Backend state stored in ``_PeerAllocInfo.window`` for one (allocation,
-    group): the imported peer mappings, torn down in
-    :meth:`CUDAIPCAllocator.close_peers`."""
+    group): the imported peer mappings and the multicast object, if any. Torn
+    down together in :meth:`CUDAIPCAllocator.close_peers`."""
 
     imported: list[_CudaMapping]
+    multicast: _CudaMulticast | None
 
 
 class CUDAIPCAllocator(SymmetricMemoryAllocatorBase):
@@ -388,10 +494,11 @@ class CUDAIPCAllocator(SymmetricMemoryAllocatorBase):
         mine = cast(_CudaMapping, rec.handle)
         transport = get_transport(mine.device)
 
-        # All-gather every rank's (size, device, host, transport), plus the
-        # shareable handle itself when it is picklable (fabric). The size travels
-        # so importers map exactly what the exporter created; host+device catch
-        # two ranks colliding on one GPU (and, for fd, a multi-host group).
+        # All-gather every rank's (size, device, host, multicast-support), plus
+        # the shareable handle itself when it is picklable (fabric). The size
+        # travels so importers map exactly what the exporter created; host+device
+        # catch two ranks colliding on one GPU (and, for fd, a multi-host group);
+        # multicast gates the multimem path on unanimity.
         payload = {
             "handle": (
                 cu_mem_export(mine.handle, transport)
@@ -401,6 +508,7 @@ class CUDAIPCAllocator(SymmetricMemoryAllocatorBase):
             "size": mine.size,
             "device": mine.device,
             "host": socket.gethostname(),
+            "multicast": cu_device_supports_multicast(mine.device),
             "transport": transport.value,
         }
         gathered_objects: list[object] = [None] * world_size
@@ -431,10 +539,11 @@ class CUDAIPCAllocator(SymmetricMemoryAllocatorBase):
                 signal_pads, dtype=torch.int64, device=device
             )
         except Exception as e:
-            # Do not leave yet: a rank that walked out here would leave its peers
-            # holding a handle this rank never got. Record the failure, vote it
-            # below, then raise on every rank. _import_peers rolls back its own
-            # partial failure; the vote-failure path below releases mappings
+            # Do not leave yet. Every rank is about to enter _init_multicast's
+            # collectives, and a rank that walked out here would leave the rest
+            # blocked in the first one until the group times out. Record the
+            # failure, vote it below, then raise. _import_peers rolls back its
+            # own partial failure; the vote-failure path below releases mappings
             # from ranks that completed the import.
             setup_error = e
 
@@ -451,21 +560,33 @@ class CUDAIPCAllocator(SymmetricMemoryAllocatorBase):
         if buffers_dev is None or signal_pads_dev is None:
             raise RuntimeError("peer pointer tensors were not initialized")
 
+        try:
+            multicast, multicast_ptr = self._init_multicast(
+                mine, gathered, pg, rank, world_size, dev_idx, off, transport
+            )
+        except Exception as e:
+            # _init_multicast tears down its own multicast state, but a raise
+            # here would still strand every peer mapping imported above.
+            for m in imported:
+                cu_vmm_free(m.base, m.size, m.handle)
+            raise e
         logger.info(
             "established CUDA-IPC peers: base=0x%x size=%d world_size=%d "
-            "(imported %d peer mapping(s))",
+            "(imported %d peer mapping(s), multicast=%s)",
             mine.base,
             mine.size,
             world_size,
             len(imported),
+            "yes" if multicast is not None else "no",
         )
         return _PeerAllocInfo(
-            window=_CudaPeerState(imported=imported),
+            window=_CudaPeerState(imported=imported, multicast=multicast),
             buffers=buffers,
             signal_pads=signal_pads,
             buffers_dev=buffers_dev,
             signal_pads_dev=signal_pads_dev,
-            multicast_ptr=0,
+            multicast_ptr=multicast_ptr,
+            multicast_base=multicast.addr if multicast is not None else 0,
             device=dev_idx,
         )
 
@@ -573,22 +694,158 @@ class CUDAIPCAllocator(SymmetricMemoryAllocatorBase):
         finally:
             _ipc_fd.close_fds(fds)
 
+    @staticmethod
+    def _teardown_multicast(
+        mc_handle: object, bound: bool, mc_addr: int, size: int, device: int
+    ) -> bool:
+        """Undo a partially built multicast object, in reverse order of
+        construction. Best-effort throughout: this only runs on paths that are
+        already failing, and bailing out early would leak the remainder."""
+        ok = True
+        if mc_addr:
+            ok = cu_mem_unmap(mc_addr, size)
+        if bound:
+            try:
+                cu_multicast_unbind(mc_handle, device, size)
+            except Exception:
+                logger.warning("cuMulticastUnbind failed during cleanup", exc_info=True)
+                ok = False
+        if mc_handle is not None:
+            ok = cu_mem_release(mc_handle) and ok
+        return ok
+
+    def _init_multicast(
+        self,
+        mine: _CudaMapping,
+        gathered: list[dict[str, object]],
+        pg: dist.ProcessGroup,
+        rank: int,
+        world_size: int,
+        dev_idx: int,
+        off: int,
+        transport: IpcHandleType,
+    ) -> tuple[_CudaMulticast | None, int]:
+        """Establish the multicast (multimem) object for this allocation, or
+        ``(None, 0)`` if it is unavailable or any rank failed to set it up.
+
+        Every step here can fail locally while its peers succeed, so each rank
+        agrees with its peers before taking a step that blocks on them, and success is
+        published only once the object is *mapped*::
+
+            rank 0: create ───────────> agree the object exists
+            exchange the handle
+            import + add_device ──────> agree before anyone binds
+            bind + map ───────────────> agree before anyone commits
+
+        The add_device agreement is what stops a failure becoming a hang:
+        ``cuMulticastBindMem`` blocks until every device has been added, so one
+        rank dying in ``add_device`` would wedge the rest in bind. The last one
+        stops a failure becoming silent divergence: a bound-but-unmapped object
+        is an intermediate state peers cannot use, so committing at bind would
+        let a rank whose map failed disagree with peers that think multicast is
+        live.
+
+        Multicast is an optimization over the peer-to-peer path, so an abandoned
+        setup is torn down and reported as unavailable rather than raised."""
+        if world_size < 2 or not all(g["multicast"] for g in gathered):
+            return None, 0  # need >= 2 devices and unanimous multicast support
+
+        size = mine.size
+        mc_handle: object = None
+        bound = False
+        mc_addr = 0
+
+        def all_agree(ok: bool) -> bool:
+            return _all_agree(pg, world_size, ok)
+
+        try:
+            # Rank 0 creates the object and everyone agrees it exists before the
+            # handle exchange. Torch folds this into the broadcast by sending an
+            # invalidator handle; we cannot, because on the POSIX-fd transport
+            # the exchange is an SCM_RIGHTS round trip with no way to say "no
+            # handle" — hence one collective more than upstream.
+            mc_exported: bytes | int | None = None
+            if rank == 0:
+                try:
+                    mc_handle = cu_multicast_create(size, world_size, transport)
+                    mc_exported = cu_mem_export(mc_handle, transport)
+                except Exception:
+                    logger.warning("multicast create/export failed", exc_info=True)
+            # The export is inside the guard and inside this vote: the exchange
+            # below is collective, so rank 0 failing to export has to degrade
+            # multicast for everyone rather than leave peers waiting in it.
+            if not all_agree(rank != 0 or mc_exported is not None):
+                self._teardown_multicast(mc_handle, bound, mc_addr, size, dev_idx)
+                return None, 0
+
+            # Only rank 0 has anything to share; everyone reads index 0.
+            shared, fds = _broadcast_handle(
+                mc_exported, pg, rank, world_size, transport
+            )
+            try:
+                if shared is None:
+                    raise RuntimeError("multicast handle exchange returned no handle")
+                if rank != 0:
+                    mc_handle = cu_mem_import(shared, transport)
+                cu_multicast_add_device(mc_handle, dev_idx)
+                local_ok = True
+            except Exception:
+                logger.warning("multicast import/add_device failed", exc_info=True)
+                local_ok = False
+            finally:
+                _ipc_fd.close_fds(fds)
+            if not all_agree(local_ok):
+                self._teardown_multicast(mc_handle, bound, mc_addr, size, dev_idx)
+                return None, 0
+
+            try:
+                cu_multicast_bind_mem(mc_handle, mine.handle, size)
+                bound = True
+                mc_addr = cu_map_handle(mc_handle, size, dev_idx)
+                local_ok = True
+            except Exception:
+                logger.warning("multicast bind/map failed", exc_info=True)
+                local_ok = False
+            if not all_agree(local_ok):
+                self._teardown_multicast(mc_handle, bound, mc_addr, size, dev_idx)
+                return None, 0
+
+            return (
+                _CudaMulticast(
+                    handle=mc_handle, addr=mc_addr, size=size, device=dev_idx
+                ),
+                mc_addr + off,
+            )
+        except Exception as e:
+            # The staged returns above only cover failure a collective
+            # *reports*. A collective can also raise outright — a group timeout
+            # or abort — and whatever was built so far would leak.
+            self._teardown_multicast(mc_handle, bound, mc_addr, size, dev_idx)
+            raise e
+
     def close_peers(self, pai: _PeerAllocInfo) -> CleanupStatus:
         state = cast(_CudaPeerState | None, pai.window)
         if state is None:
             return CleanupStatus.CLEANED
-        if not state.imported:
+        mc = state.multicast
+        if mc is None and not state.imported:
             pai.window = None
             return CleanupStatus.CLEANED
         # The guard synchronizes the device that *owns* these mappings, not
         # whichever happens to be current: free_pool drains outside its
         # torch.cuda.device block, and unmapping under the wrong context leaves
         # kernels on the owning device reading memory that is already gone.
-        owner = state.imported[0].device
+        owner = mc.device if mc is not None else state.imported[0].device
         if _cuda.should_skip_cuda_cleanup(owner):
             return CleanupStatus.DEFERRED
         ok = True
         with torch.cuda.device(owner):
+            # Multicast first: unmap + unbind + release BEFORE the bound block is
+            # released (in free_physical) — cuMulticastUnbind must see it alive.
+            if mc is not None:
+                ok = self._teardown_multicast(
+                    mc.handle, True, mc.addr, mc.size, mc.device
+                )
             # cu_vmm_free logs and continues, so one bad mapping cannot abandon
             # the rest of the batch.
             for m in state.imported:
@@ -694,3 +951,34 @@ def _share_handles(
         raise RuntimeError(f"fd exchange lost the handle from rank(s) {missing}")
     handles: list[bytes | int | None] = list(fds)
     return handles, fds
+
+
+def _broadcast_handle(
+    exported: bytes | int | None,
+    pg: dist.ProcessGroup,
+    rank: int,
+    world_size: int,
+    transport: IpcHandleType,
+) -> tuple[bytes | int | None, list[int | None]]:
+    """Share rank 0's already-exported multicast handle with every rank. Returns
+    it plus the fds to close afterwards.
+
+    The caller exports and votes on that succeeding, because this function is
+    collective — rank 0 failing here would strand every peer inside it."""
+    if transport is IpcHandleType.FABRIC:
+        shared: list[object] = [None for _ in range(world_size)]
+        dist.all_gather_object(shared, exported, group=pg)
+        return cast(bytes | int | None, shared[0]), []
+    fd = cast(int | None, exported)
+    try:
+        fds = _ipc_fd.all_gather_fds(fd, pg, rank, world_size)
+    except BaseException as e:
+        if fd is not None:
+            os.close(fd)
+        raise e
+    if fds[0] is None:
+        # Only the root contributes here, so an empty root slot means the ring
+        # lost it — a transport bug, not the caller declining to export.
+        _ipc_fd.close_fds(fds)
+        raise RuntimeError("fd exchange lost the multicast handle from rank 0")
+    return fds[0], fds

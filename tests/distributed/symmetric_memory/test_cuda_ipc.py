@@ -135,7 +135,7 @@ def test_failed_peer_cleanup_retains_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapping = _cuda_ipc._CudaMapping(0x1000, 4096, object(), 0)
-    state = _cuda_ipc._CudaPeerState(imported=[mapping])
+    state = _cuda_ipc._CudaPeerState(imported=[mapping], multicast=None)
     empty = torch.empty(0, dtype=torch.int64)
     pai = sm._PeerAllocInfo(state, [], [], empty, empty, 0, device=0)
     monkeypatch.setattr(
@@ -161,6 +161,7 @@ def test_rendezvous_oom_reuses_existing_agreement(
         _cuda_ipc, "get_transport", lambda _dev: _cuda_ipc.IpcHandleType.FABRIC
     )
     monkeypatch.setattr(_cuda_ipc, "cu_mem_export", lambda *_args: b"handle")
+    monkeypatch.setattr(_cuda_ipc, "cu_device_supports_multicast", lambda _dev: False)
 
     def gather(out: list[object], payload: object, group: object) -> None:
         out[0] = payload
@@ -175,6 +176,11 @@ def test_rendezvous_oom_reuses_existing_agreement(
         _cuda_ipc.CUDAIPCAllocator,
         "_import_peers",
         lambda *_args: ([mine.base], imported),
+    )
+    monkeypatch.setattr(
+        _cuda_ipc.CUDAIPCAllocator,
+        "_init_multicast",
+        lambda *_args: pytest.fail("multicast setup ran after pointer-tensor OOM"),
     )
 
     def agree(_pg: object, _world_size: int, ok: bool) -> bool:
