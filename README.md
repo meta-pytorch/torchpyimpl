@@ -23,14 +23,13 @@ on regular `torch.Tensor`s, and require no C++ build.
 
 ## Prerequisites
 
-- Python 3.12 or higher
+- Python 3.12 through 3.14
 - PyTorch nightly
 - CUDA 13 capable NVIDIA GPU
 
 ## Installation
 
-With [uv](https://docs.astral.sh/uv/) (recommended), which resolves PyTorch
-nightly from `uv.lock`:
+With [uv](https://docs.astral.sh/uv/) (recommended):
 
 ```bash
 git clone https://github.com/meta-pytorch/torchpyimpl.git
