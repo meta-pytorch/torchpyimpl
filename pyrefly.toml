@@ -1,0 +1,4 @@
+python-version = "3.12"
+project-includes = ["torchpyimpl"]
+search-path = [".", "stubs"]
+python-interpreter-path = ".venv/bin/python"

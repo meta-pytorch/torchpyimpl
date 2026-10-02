@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 from __future__ import annotations
 
 import logging
@@ -15,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -30,7 +29,7 @@ class GroupInfo:
 @dataclass(frozen=True)
 class _CacheEntry:
     info: GroupInfo
-    group_ref: "weakref.ref[dist.ProcessGroup]"
+    group_ref: weakref.ref[dist.ProcessGroup]
 
 
 _group_cache: dict[tuple[int, int, bool], _CacheEntry] = {}
@@ -56,7 +55,7 @@ def get_nccl_comm_ptr(pg: dist.ProcessGroup, device: torch.device) -> int:
     return get_group_info(pg, device).comm_ptr
 
 
-_synthetic_ids: "weakref.WeakKeyDictionary[dist.ProcessGroup, dict[int, int]]" = (
+_synthetic_ids: weakref.WeakKeyDictionary[dist.ProcessGroup, dict[int, int]] = (
     weakref.WeakKeyDictionary()
 )
 _next_synthetic_id: int = 0
@@ -77,7 +76,8 @@ def _synthetic_group_id(pg: dist.ProcessGroup, dev_index: int) -> int:
 
 def _resolve_comm_ptr(pg: dist.ProcessGroup, device: torch.device) -> int:
     backend = dist.get_backend_impl(pg, device)
-    ptr = int(backend.comm_ptr)  # pyre-ignore[16]
+    # pyrefly: ignore [missing-attribute]
+    ptr = int(backend.comm_ptr)
     if ptr == 0:
         raise RuntimeError(
             f"{type(backend).__name__} returned a null comm pointer for device "
