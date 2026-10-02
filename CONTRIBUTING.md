@@ -27,9 +27,9 @@ disclosure of security bugs. In those cases, please go through the process
 outlined on that page and do not file a public issue.
 
 ## Coding Style
-* Formatting and import order are enforced by `lintrunner` (ruff + usort).
+* `lintrunner` runs the same formatting (usort, isort, ruff format), linting
+  (ruff) and type checking (pyrefly) setup as PyTorch.
 * 88 character line length.
-* Type annotations are checked with pyre.
 * Tests that need GPUs are marked `@pytest.mark.gpu` or `@pytest.mark.multi_gpu`.
 
 ## License

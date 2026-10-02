@@ -1,37 +1,55 @@
 [[linter]]
-code = 'PYRE'
+code = 'PYFMT'
 include_patterns = [
-    "torchpyimpl/**/*.py",
-    "torchpyimpl/**/*.pyi",
-]
-command = [
-    'python3',
-    'tools/linter/adapters/pyre_linter.py',
-    '--',
-    '@{{PATHSFILE}}'
-]
-init_command = [
-    'bash',
-    'scripts/setup_pyre.sh',
-    '--dry-run={{DRYRUN}}',
-]
-is_formatter = false
-
-[[linter]]
-code = 'UFMT'
-include_patterns = [
-    "torchpyimpl/**/*.py",
-    "torchpyimpl/**/*.pyi",
-    "tests/**/*.py",
-    "tools/**/*.py",
-    "conftest.py",
+    'torchpyimpl/**/*.py',
+    'torchpyimpl/**/*.pyi',
+    'tests/**/*.py',
+    'benchmarks/**/*.py',
+    'tools/**/*.py',
+    'conftest.py',
 ]
 command = [
     'uv',
     'run',
     '--script',
-    'tools/linter/adapters/ufmt_linter.py',
+    'tools/linter/adapters/pyfmt_linter.py',
     '--',
     '@{{PATHSFILE}}'
 ]
 is_formatter = true
+
+[[linter]]
+code = 'RUFF'
+include_patterns = [
+    '**/*.py',
+    '**/*.pyi',
+    'pyproject.toml',
+]
+exclude_patterns = [
+    'stubs/**',
+]
+command = [
+    'uv',
+    'run',
+    '--script',
+    'tools/linter/adapters/ruff_linter.py',
+    '--config=pyproject.toml',
+    '--show-disable',
+    '--',
+    '@{{PATHSFILE}}'
+]
+is_formatter = true
+
+[[linter]]
+code = 'PYREFLY'
+include_patterns = [
+    'torchpyimpl/**/*.py',
+    'torchpyimpl/**/*.pyi',
+]
+command = [
+    'uv',
+    'run',
+    '--script',
+    'tools/linter/adapters/pyrefly_linter.py',
+    '--config=pyrefly.toml',
+]

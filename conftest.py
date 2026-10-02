@@ -28,7 +28,7 @@ def pytest_collection_modifyitems(config, items):
     try:
         regex = re.compile(pattern)
     except re.error as e:
-        raise pytest.UsageError(f"Invalid DISABLED_TESTS regex {pattern!r}: {e}")
+        raise pytest.UsageError(f"Invalid DISABLED_TESTS regex {pattern!r}: {e}") from e
 
     skip_marker = pytest.mark.skip(reason=f"disabled via DISABLED_TESTS={pattern!r}")
     for item in items:

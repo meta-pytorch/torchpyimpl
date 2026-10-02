@@ -4,11 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 """Pure-Python implementations of PyTorch GPU and distributed subsystems."""
 
 from importlib.metadata import PackageNotFoundError, version
+
 
 try:
     __version__: str = version("torchpyimpl")

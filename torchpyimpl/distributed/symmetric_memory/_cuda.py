@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 """CUDA driver wrappers (``cuda.bindings.driver``).
 
 ``cu_memset_d8`` does not go through the CUDA caching allocator, so it is safe
@@ -20,6 +18,7 @@ import sys
 
 import torch
 from cuda.bindings import driver
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
