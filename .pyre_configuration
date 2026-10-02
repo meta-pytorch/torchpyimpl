@@ -5,8 +5,14 @@
   ],
   "site_package_search_strategy": "all",
   "source_directories": [
-    "torchpyimpl"
+    {
+      "import_root": ".",
+      "source": "torchpyimpl"
+    }
   ],
   "strict": false,
-  "version": "0.0.101749035478"
+  "version": "0.0.101749035478",
+  "search_path": [
+    "stubs"
+  ]
 }
