@@ -41,10 +41,9 @@ def _socket_path() -> str:
 def all_gather_fds(
     local_fd: int | None,
     pg: dist.ProcessGroup | None,
-    rank: int,
-    world_size: int,
 ) -> list[int | None]:
-    """Collective. Return every rank's fd, indexed by rank.
+    """Collective over ``pg``. Return every rank's fd, indexed by group rank.
+    ``pg=None`` means a single rank. If one rank fails, every rank raises.
 
     ``local_fd`` may be ``None`` for a rank with nothing to contribute (used to
     broadcast one rank's multicast handle: only the creator passes an fd, and
@@ -55,10 +54,12 @@ def all_gather_fds(
     imported (see :func:`close_fds`); ``local_fd`` is not closed here and is
     returned at index ``rank``.
     """
+    if pg is None:
+        return [local_fd]
+    rank = dist.get_rank(pg)
+    world_size = dist.get_world_size(pg)
     if world_size == 1:
         return [local_fd]
-    if pg is None:
-        raise ValueError("pg is required when world_size is greater than one")
 
     # Set up before the collective below, so every peer is already listening by
     # the time anyone learns its address — no connect/send retry needed. This is
@@ -95,10 +96,21 @@ def all_gather_fds(
         fds[rank] = local_fd
         dst = paths[(rank + 1) % world_size]
         in_flight = local_fd
-        for step in range(1, world_size):
-            _send_fd(sock, dst, in_flight)
-            in_flight = _recv_fd(sock)
-            fds[(rank - step) % world_size] = in_flight
+        ring_error: Exception | None = None
+        try:
+            for step in range(1, world_size):
+                _send_fd(sock, dst, in_flight)
+                in_flight = _recv_fd(sock)
+                fds[(rank - step) % world_size] = in_flight
+        except Exception as e:
+            ring_error = e
+        oks: list[object] = [None] * world_size
+        dist.all_gather_object(oks, ring_error is None, group=pg)
+        if ring_error is not None:
+            raise ring_error
+        if not all(oks):
+            failed = [i for i, ok in enumerate(oks) if not ok]
+            raise RuntimeError(f"rank(s) {failed} failed the fd exchange")
         return fds
     except BaseException as e:
         # BaseException, not Exception: the callers guard their own export the

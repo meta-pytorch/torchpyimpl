@@ -938,7 +938,7 @@ def _share_handles(
         handles = [cast(bytes | int | None, info["handle"]) for info in gathered]
         return handles, []
     try:
-        fds = _ipc_fd.all_gather_fds(exported, pg, rank, world_size)
+        fds = _ipc_fd.all_gather_fds(exported, pg)
     except BaseException as e:
         if exported is not None:
             os.close(exported)
@@ -971,7 +971,7 @@ def _broadcast_handle(
         return cast(bytes | int | None, shared[0]), []
     fd = cast(int | None, exported)
     try:
-        fds = _ipc_fd.all_gather_fds(fd, pg, rank, world_size)
+        fds = _ipc_fd.all_gather_fds(fd, pg)
     except BaseException as e:
         if fd is not None:
             os.close(fd)

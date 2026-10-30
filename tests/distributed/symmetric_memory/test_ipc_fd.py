@@ -51,14 +51,14 @@ def _worker(rank: int, world_size: int, port: int, tmp: str, result_path: str) -
         fd = os.open(path, os.O_RDONLY)
 
         # All ranks contribute: each receives every peer's fd for the same file.
-        fds = _ipc_fd.all_gather_fds(fd, pg, rank, world_size)
+        fds = _ipc_fd.all_gather_fds(fd, pg)
         contents = [_read(f) if f is not None else None for f in fds]
         own_returned = fds[rank] == fd
         _ipc_fd.close_fds([f for i, f in enumerate(fds) if i != rank])
 
         # Only rank 0 contributes: None relays through the ring, and every rank
         # reads index 0.
-        root = _ipc_fd.all_gather_fds(fd if rank == 0 else None, pg, rank, world_size)
+        root = _ipc_fd.all_gather_fds(fd if rank == 0 else None, pg)
         root_content = _read(root[0]) if root[0] is not None else None
         others_none = all(f is None for i, f in enumerate(root) if i not in (0,))
         if rank != 0 and root[0] is not None:
@@ -107,8 +107,57 @@ def test_all_gather_fds(tmp_path: pathlib.Path) -> None:
         assert not r["leftover_sockets"], f"rank {rank}: {r['leftover_sockets']}"
 
 
+def _failure_worker(rank: int, world_size: int, port: int, result_path: str) -> None:
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        if rank == 1:
+            # Fail at the last receive, after rank 1 has sent all its datagrams.
+            recv_fd = _ipc_fd._recv_fd
+            calls = [0]
+
+            def recv_then_fail(sock: socket.socket) -> int | None:
+                calls[0] += 1
+                fd = recv_fd(sock)
+                if calls[0] == world_size - 1:
+                    raise RuntimeError("injected receive failure")
+                return fd
+
+            _ipc_fd._recv_fd = recv_then_fail
+        error = ""
+        try:
+            _ipc_fd.all_gather_fds(os.open(os.devnull, os.O_RDONLY), dist.group.WORLD)
+        except RuntimeError as e:
+            error = str(e)
+        errors: list[Any] = [None] * world_size
+        dist.all_gather_object(errors, error)
+        if rank == 0:
+            with open(result_path, "w") as f:
+                json.dump(errors, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_all_gather_fds_raises_on_every_rank_when_one_rank_fails(
+    tmp_path: pathlib.Path,
+) -> None:
+    result_path = str(tmp_path / "errors.json")
+    mp.spawn(
+        _failure_worker,
+        args=(_WORLD_SIZE, _free_port(), result_path),
+        nprocs=_WORLD_SIZE,
+        join=True,
+    )
+    with open(result_path) as f:
+        errors = json.load(f)
+    assert "injected" in errors[1], errors
+    assert all("rank(s) [1] failed" in e for i, e in enumerate(errors) if i != 1), (
+        errors
+    )
+
+
 def test_single_rank_returns_local_fd() -> None:
-    assert _ipc_fd.all_gather_fds(7, None, 0, 1) == [7]
+    assert _ipc_fd.all_gather_fds(7, None) == [7]
 
 
 @pytest.mark.parametrize("fds", [[], [None], [None, None]])

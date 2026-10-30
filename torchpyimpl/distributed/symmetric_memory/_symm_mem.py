@@ -42,7 +42,9 @@ _SIGNAL_PAD_ENV: str = "TORCHPYIMPL_SIGNAL_PAD_BYTES"
 
 # The pad size is frozen on the first allocation: ``buffer_offset`` is baked into
 # every live allocation's layout and the O(1) lookup, so it must not change once
-# any allocation exists.
+# any allocation exists. Kept here, not in os.environ, so a later environment
+# change cannot move it and child processes do not inherit it.
+_signal_pad_size: int | None = None
 _pad_frozen: bool = False
 
 
@@ -52,13 +54,15 @@ def _round_up(n: int, alignment: int) -> int:
 
 def signal_pad_bytes() -> int:
     """The per-segment signal-pad size, in bytes. Configurable via
-    ``TORCHPYIMPL_SIGNAL_PAD_BYTES`` / :func:`set_signal_pad_size` before the first
-    allocation.
+    :func:`set_signal_pad_size` or ``TORCHPYIMPL_SIGNAL_PAD_BYTES`` before the
+    first allocation.
 
     Validated here, not only in :func:`set_signal_pad_size`: the environment
     variable reaches ``buffer_offset`` without passing through the setter, and a
     non-positive pad would put the data pointer at or before the allocation base
     and leave the signal-pad kernels addressing the data buffer."""
+    if _signal_pad_size is not None:
+        return _signal_pad_size
     size = int(os.environ.get(_SIGNAL_PAD_ENV, DEFAULT_SIGNAL_PAD_BYTES))
     if size <= 0:
         raise ValueError(f"{_SIGNAL_PAD_ENV} must be positive, got {size}")
@@ -83,6 +87,7 @@ def set_signal_pad_size(size: int) -> None:
     """Set the signal-pad size for future allocations. Must be called before the
     first symmetric-memory allocation — the offset is baked in once allocations
     exist, so changing it afterward would desync the layout across ranks."""
+    global _signal_pad_size
     if _pad_frozen:
         raise RuntimeError(
             "set_signal_pad_size must be called before any symmetric-memory "
@@ -90,7 +95,7 @@ def set_signal_pad_size(size: int) -> None:
         )
     if size <= 0:
         raise ValueError(f"signal pad size must be positive, got {size}")
-    os.environ[_SIGNAL_PAD_ENV] = str(size)
+    _signal_pad_size = size
 
 
 def get_signal_pad_size() -> int:
@@ -142,9 +147,7 @@ class AllocRecord:
     buffer_size: int  # size requested from the allocator (data region)
     device: int  # cuda device index
     handle: object  # backend handle owning the physical memory
-    # Allocation order, identical across ranks under SPMD. Deferred releases are
-    # drained in this order so the collective window deregisters line up, the
-    # way torch's registration_counter does for its own pool enumeration.
+    # Allocation order. release_pending drains deferred releases in this order.
     seq: int = 0
     per_comm: dict[int, _PeerAllocInfo] = field(default_factory=dict)
     # Handle cache, subordinate to this record so eviction is automatic: every
@@ -202,8 +205,7 @@ class SymmetricMemoryAllocatorBase:
     requires_nccl_comm: bool = True
 
     def __init__(self) -> None:
-        # keyed on the DATA ptr we hand out; insertion order == allocation order
-        # (used for cross-rank-consistent window deregistration at teardown).
+        # keyed on the DATA ptr we hand out; insertion order == allocation order.
         self._records: dict[int, AllocRecord] = {}
         # Allocations the CUDA caching allocator has released but whose windows
         # and physical memory we have not reclaimed yet. See free().
@@ -226,12 +228,14 @@ class SymmetricMemoryAllocatorBase:
         """Allocate ``size`` data bytes of symmetric memory (plus the hidden
         front signal pad). Returns the data pointer."""
         idx = _device_index(device)
-        # buffer_offset validates the configured pad size and may raise; freeze
-        # only once it has, or a bad TORCHPYIMPL_SIGNAL_PAD_BYTES would wedge the
-        # process with a frozen pad that set_signal_pad_size can no longer fix.
-        off = buffer_offset()
-        global _pad_frozen
+        # signal_pad_bytes validates the configured pad size and may raise;
+        # freeze only once it has, or a bad TORCHPYIMPL_SIGNAL_PAD_BYTES would
+        # wedge the process with a frozen pad that set_signal_pad_size can no
+        # longer fix.
+        global _signal_pad_size, _pad_frozen
+        _signal_pad_size = signal_pad_bytes()
         _pad_frozen = True
+        off = buffer_offset()
         block_size = off + _round_up(size, 16)
 
         base, handle = self.alloc_physical(block_size, idx)
@@ -239,7 +243,8 @@ class SymmetricMemoryAllocatorBase:
         try:
             # Backend allocations are not guaranteed to be zeroed; initialize
             # the front signal pad before CAS-based signal kernels can observe it.
-            self.initialize_physical(handle, base, off)
+            with torch.cuda.device(idx):
+                self.initialize_physical(handle, base, off)
             with self._lock:
                 self._records[buffer_ptr] = AllocRecord(
                     alloc_base=base,
@@ -301,10 +306,12 @@ class SymmetricMemoryAllocatorBase:
     ) -> None:
         """Retire the allocation: drop it from lookup and queue it for release.
 
-        Deliberately does no collective and no driver call. The caching allocator
-        releases segments in an order that can differ across ranks, so issuing
-        collective ``ncclCommWindowDeregister`` calls here could deadlock.
-        :meth:`release_pending` does the real work from the ordered teardown path."""
+        Does no driver call. The caching allocator can release a segment on
+        one rank only. NCCL window deregistration is local to the rank, but
+        NCCL gives each new window an offset that depends on the windows that
+        the rank has, and binds multicast at that offset. Thus all ranks must
+        keep the same windows. :meth:`release_pending` releases them from a
+        teardown path that every rank runs."""
         with self._lock:
             rec = self._records.pop(buffer_ptr, None)
             if rec is None:
@@ -321,10 +328,8 @@ class SymmetricMemoryAllocatorBase:
     def release_pending(self, device: torch.device | int | None = None) -> int:
         """Close queued windows and release their memory, in allocation order.
 
-        Must be called from a path the caller controls — never from the
-        allocator callback. Sorting on ``seq`` is what makes the collective
-        deregisters agree across ranks even though the caching allocator freed
-        the segments in its own order."""
+        Call it on every rank, from a path the caller controls. Never call it
+        from the allocator callback."""
         idx = None if device is None else _device_index(device)
         with self._lock:
             items = [
@@ -415,8 +420,8 @@ class SymmetricMemoryAllocatorBase:
     def release_peer_resources(self, device: torch.device | int | None = None) -> int:
         """Release peer resources in allocation order.
 
-        Keep the physical memory until the pool releases its segments. All
-        ranks use the same allocation order for collective cleanup operations.
+        Keep the physical memory until the pool releases its segments. Call it
+        on every rank.
         """
         idx = _device_index(device)
         with self._lock:
@@ -507,6 +512,12 @@ class SymmetricMemoryAllocatorBase:
         rec, offset = self.find_covering(buffer_ptr)
         if rec is None:
             raise KeyError(f"no symmetric allocation covers ptr 0x{buffer_ptr:x}")
+        available = rec.buffer_size - offset
+        if size is not None and not 0 < size <= available:
+            raise ValueError(
+                f"rendezvous: size {size} is not in (0, {available}] for "
+                f"0x{buffer_ptr:x}"
+            )
 
         key = (buffer_ptr, comm_ptr)
         with self._lock:

@@ -8,12 +8,38 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 import torchpyimpl.distributed.symmetric_memory._symm_mem as sm
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+_current_device: list[int] = []
+
+
+@contextlib.contextmanager
+def _fake_cuda_device(idx: int) -> Iterator[None]:
+    _current_device.append(idx)
+    try:
+        yield
+    finally:
+        _current_device.pop()
+
+
+@pytest.fixture(autouse=True)
+def _unfrozen_signal_pad(monkeypatch: pytest.MonkeyPatch) -> None:
+    # alloc freezes the pad size for the process; start each test unfrozen.
+    monkeypatch.setattr(sm, "_signal_pad_size", None)
+    monkeypatch.setattr(sm, "_pad_frozen", False)
+    monkeypatch.setattr(torch.cuda, "device", _fake_cuda_device)
 
 
 def test_buffer_offset_matches_signal_pad_rounding() -> None:
@@ -104,7 +130,6 @@ def test_alloc_rolls_back_if_publication_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     allocator = _FaultInjectingAllocator()
-    monkeypatch.setattr(sm, "_pad_frozen", False)
 
     def fail_memset(*_args: object) -> None:
         raise torch.OutOfMemoryError("injected")
@@ -124,7 +149,6 @@ def test_alloc_retries_deferred_rollback(monkeypatch: pytest.MonkeyPatch) -> Non
         sm.CleanupStatus.DEFERRED,
         sm.CleanupStatus.CLEANED,
     ]
-    monkeypatch.setattr(sm, "_pad_frozen", False)
 
     def fail_memset(*_args: object) -> None:
         raise torch.OutOfMemoryError("injected")
@@ -143,7 +167,6 @@ def test_release_pending_retries_deferred_window_and_drains_siblings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     allocator = _FaultInjectingAllocator()
-    monkeypatch.setattr(sm, "_pad_frozen", False)
     monkeypatch.setattr(sm, "cu_memset_d8", lambda *_args: None)
     ptr = allocator.alloc(1024, 0)
     device = torch.device("cpu")
@@ -169,7 +192,6 @@ def test_release_pending_does_not_count_deferred_physical_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     allocator = _FaultInjectingAllocator()
-    monkeypatch.setattr(sm, "_pad_frozen", False)
     allocator.free_statuses = [
         sm.CleanupStatus.DEFERRED,
         sm.CleanupStatus.CLEANED,
@@ -188,7 +210,6 @@ def test_release_pending_retains_failed_record_and_drains_siblings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     allocator = _FaultInjectingAllocator()
-    monkeypatch.setattr(sm, "_pad_frozen", False)
     monkeypatch.setattr(sm, "cu_memset_d8", lambda *_args: None)
     ptr = allocator.alloc(1024, 0)
     device = torch.device("cpu")
@@ -207,7 +228,6 @@ def _allocator_with_one_alloc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[_FaultInjectingAllocator, int]:
     allocator = _FaultInjectingAllocator()
-    monkeypatch.setattr(sm, "_pad_frozen", False)
     monkeypatch.setattr(sm, "cu_memset_d8", lambda *_args: None)
     return allocator, allocator.alloc(_NBYTES, 0)
 
@@ -230,6 +250,37 @@ def test_alloc_layout_and_find_covering(monkeypatch: pytest.MonkeyPatch) -> None
 
     allocator.free(buf)
     assert allocator.find_covering(buf) == (None, 0)
+
+
+def test_alloc_zeroes_signal_pad_on_its_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator = _FaultInjectingAllocator()
+    calls: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(
+        sm,
+        "cu_memset_d8",
+        lambda ptr, _value, n: calls.append((ptr, n, _current_device[-1])),
+    )
+    allocator.alloc(_NBYTES, 3)
+    assert calls == [(0x100000, sm.buffer_offset(), 3)]
+
+
+def test_signal_pad_size_is_fixed_at_first_alloc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(sm._SIGNAL_PAD_ENV, raising=False)
+    sm.set_signal_pad_size(256)
+    assert sm._SIGNAL_PAD_ENV not in os.environ
+    allocator, buf = _allocator_with_one_alloc(monkeypatch)
+    assert buf == 0x100000 + 256
+
+    monkeypatch.setenv(sm._SIGNAL_PAD_ENV, "512")
+    assert sm.buffer_offset() == 256
+    rec, o = allocator.find_covering(buf + 64)
+    assert rec is not None and o == 64
+    with pytest.raises(RuntimeError):
+        sm.set_signal_pad_size(512)
 
 
 def test_rendezvous_is_cached_per_ptr_and_comm(
@@ -258,6 +309,18 @@ def test_rendezvous_is_cached_per_ptr_and_comm(
     assert allocator.release_pending() == 1
     assert allocator.close_calls == [11]
     assert allocator.cache_stats()["records"] == 0
+
+
+def test_rendezvous_rejects_size_outside_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator, buf = _allocator_with_one_alloc(monkeypatch)
+    device = torch.device("cpu")
+    for ptr, size in ((buf, 0), (buf, _NBYTES + 1), (buf + 64, _NBYTES - 63)):
+        with pytest.raises(ValueError, match="not in"):
+            allocator.rendezvous(ptr, 11, 0, 1, device, size=size)
+    h = allocator.rendezvous(buf + 64, 11, 0, 1, device, size=_NBYTES - 64)
+    assert h.size == _NBYTES - 64
 
 
 def test_rendezvous_rejects_uncovered_ptr(monkeypatch: pytest.MonkeyPatch) -> None:

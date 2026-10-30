@@ -43,6 +43,13 @@ def test_cu_memset_d8_zeroes_region() -> None:
     torch.cuda.synchronize(device)
     assert bool(torch.all(t == 7).item())
 
+    # The zeroing is complete when the call returns, also behind queued work.
+    t.fill_(0xAB)
+    torch.cuda._sleep(100_000_000)
+    cu_memset_d8(t.data_ptr(), 0, t.numel())
+    assert torch.cuda.current_stream(device).query()
+    assert bool(torch.all(t == 0).item())
+
 
 @pytest.mark.gpu
 def test_cu_stream_write_value32_writes_one_slot() -> None:

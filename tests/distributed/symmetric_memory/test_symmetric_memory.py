@@ -22,10 +22,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from cuda.bindings import driver
 
 import torchpyimpl.distributed.symmetric_memory._symm_mem as sm
 from torchpyimpl.distributed.symmetric_memory._comm import get_group_info
-from torchpyimpl.distributed.symmetric_memory._cuda import cu_mem_get_address_range
+from torchpyimpl.distributed.symmetric_memory._cuda import (
+    cu_mem_get_address_range,
+    cu_memset_d8,
+)
 from torchpyimpl.distributed.symmetric_memory.backends import _cuda_ipc
 
 
@@ -140,6 +144,16 @@ def _standalone_rendezvous_worker(
         h1 = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
         h2 = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
         stats = sm._cache_stats()
+
+        # Each rank fills its buffer with rank + 1, then reads every peer's.
+        cu_memset_d8(buf, rank + 1, nbytes)
+        dist.barrier(group=pg)
+        peer_data_ok = True
+        for peer in range(world_size):
+            dst = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            (err,) = driver.cuMemcpy(dst.data_ptr(), h1.buffer_ptrs[peer], nbytes)
+            ok = err == driver.CUresult.CUDA_SUCCESS
+            peer_data_ok = peer_data_ok and ok and bool((dst == peer + 1).all())
         report: dict[str, Any] = {
             "rank": rank,
             "buffer_ptrs_len": len(h1.buffer_ptrs),
@@ -150,6 +164,7 @@ def _standalone_rendezvous_worker(
             "cached_lookup": sm.get_cached_handle(buf, comm_ptr) is h1,
             "peer_alloc_infos": stats["peer_alloc_infos"],
             "transport": _cuda_ipc.get_transport(rank).value,
+            "peer_data_ok": peer_data_ok,
         }
         dist.barrier(group=pg)
         sm.free(buf)
@@ -190,5 +205,6 @@ def test_standalone_rendezvous_cache_and_free(
         assert r["cached_lookup"], f"rank {rank}: get_cached_handle miss"
         assert r["peer_alloc_infos"] == 1, rank
         assert r["transport"] == transport, rank
+        assert r["peer_data_ok"], f"rank {rank}: wrong data read from a peer"
         assert r["peer_alloc_infos_after_free"] == 0, rank
         assert r["records_after_free"] == 0, rank
