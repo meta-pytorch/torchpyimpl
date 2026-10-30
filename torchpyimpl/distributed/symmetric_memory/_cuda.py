@@ -70,7 +70,8 @@ def cu_stream_write_value32(ptr: int, value: int, stream: int) -> None:
 def cu_memset_d8(ptr: int, value: int, n: int) -> None:
     """Set ``n`` bytes at device ``ptr`` to ``value`` (wraps ``cuMemsetD8``).
 
-    Synchronous on the current context; used to zero the signal pad at alloc.
+    Synchronizes the current context before it returns; used to zero the
+    signal pad at alloc, so a peer cannot write a signal before the zeroing.
     Raises on driver error (an unzeroed pad would corrupt signal-pad kernels).
     ``n == 0`` is a legitimate no-op; ``n < 0`` is a caller bug (an underflowed
     size computation) and raises rather than skipping the zeroing in silence."""
@@ -82,6 +83,7 @@ def cu_memset_d8(ptr: int, value: int, n: int) -> None:
     (err,) = driver.cuMemsetD8(ptr, value & 0xFF, n)
     if err != driver.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"cuMemsetD8 failed at 0x{ptr:x}: {err}")
+    cu_ctx_synchronize()
 
 
 def cu_ctx_synchronize() -> None:
