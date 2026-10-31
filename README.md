@@ -66,6 +66,29 @@ uv run pytest tests/ -m "not gpu and not multi_gpu"
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Third-party dependencies
+
+torchpyimpl requires the third-party packages below. They are not part of
+torchpyimpl and are not distributed with it; your package manager installs
+them from their own sources. Each package is subject to its own license terms,
+which are separate from the torchpyimpl license. Review and follow those terms
+when you install or use them.
+
+| Package | Required for | License |
+|---|---|---|
+| [PyTorch](https://github.com/pytorch/pytorch) (`torch`) | runtime | BSD 3-Clause; includes third-party components under other licenses |
+| [Triton](https://github.com/triton-lang/triton) (`triton`, Linux) | runtime | MIT |
+| [CUDA Python](https://github.com/NVIDIA/cuda-python) (`cuda-python`) | runtime | Apache 2.0 |
+| [nccl4py](https://github.com/NVIDIA/nccl) (`nccl4py`) | runtime | Apache 2.0 |
+| [CUTLASS DSL / CuTeDSL](https://github.com/NVIDIA/cutlass) (`nvidia-cutlass-dsl`) | runtime | [NVIDIA Software License Agreement](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html) |
+| [pytest](https://github.com/pytest-dev/pytest) (`pytest`) | development | MIT |
+| [lintrunner](https://github.com/suo/lintrunner) (`lintrunner`) | development | MIT |
+
+These packages also install their own dependencies. These include NVIDIA CUDA
+libraries (for example `nvidia-nccl-cu13` and other `nvidia-*` packages), which
+are subject to NVIDIA license terms. The license for each package is in its
+package metadata and its source repository.
+
 ## License
 
 torchpyimpl is BSD 3-Clause licensed, as found in the [LICENSE](LICENSE) file.
