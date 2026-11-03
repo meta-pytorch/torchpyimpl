@@ -4,4 +4,4 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Symmetric-memory backends, imported lazily by ``_symm_mem``."""
+"""Provide symmetric memory backends that ``_symm_mem`` imports on demand."""

@@ -6,7 +6,8 @@
 
 """Symmetric memory, modeled on torch.distributed._symmetric_memory.
 
-The accessors are module functions that take a handle, not handle methods.
+The accessors are module functions that take a handle. The signal-pad
+operations (barrier, put_signal, wait_signal) are handle methods, as in torch.
 """
 
 from torchpyimpl.distributed.symmetric_memory._api import (

@@ -214,14 +214,22 @@ def test_standalone_rendezvous_cache_and_free(
 # ── MemPool API ───────────────────────────────────────────────────────────────
 
 
-def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> None:
-    # Must be set before the first allocation: cuMemCreate bakes the handle type
-    # into the block.
-    os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
-    _cuda_ipc.reset_transport()
+def _worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    out: str,
+    backend: str,
+    transport: str | None,
+) -> None:
+    if transport is not None:
+        # Must be set before the first allocation: cuMemCreate bakes the handle
+        # type into the block.
+        os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
+        _cuda_ipc.reset_transport()
     device = _init_dist(rank, world_size, port)
     try:
-        symm.set_backend("CUDA")
+        symm.set_backend(backend)
         pg = dist.new_group(ranks=list(range(world_size)))
 
         tensors = [
@@ -254,9 +262,52 @@ def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> 
         mc_flags: list[Any] = [None] * world_size
         dist.all_gather_object(mc_flags, symm.has_multicast_support(hdl), group=pg)
 
+        # Fence: the sum above is only correct while every rank still holds
+        # rank+1, so no rank may start stamping until all have summed.
+        dist.barrier(group=pg)
+
+        # Signal-pad barrier: stamp our buffer, barrier, then every peer's stamp
+        # must be visible.
+        symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32).fill_(float(rank + 100))
+        torch.cuda.synchronize(device)
+        hdl.barrier()
+        stamps = [
+            float(symm.get_buffer(hdl, p, (1,), torch.float32)[0].item())
+            for p in range(world_size)
+        ]
+        # Second round, with another device current: slots must have been left
+        # reusable, and the kernel must run on the handle's device.
+        with torch.cuda.device((rank + 1) % torch.cuda.device_count()):
+            hdl.barrier()
+        torch.cuda.synchronize(device)
+
+        # put_signal / wait_signal ring on channel 1: after the send lands, the
+        # predecessor's slot reads 1, and wait_signal resets it to 0.
+        succ, pred = (rank + 1) % world_size, (rank - 1) % world_size
+        slot = 1 * world_size + pred  # channel * world_size + src
+        hdl.put_signal(succ, channel=1)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=pg)
+        own_pad = symm.get_signal_pad(hdl, rank)
+        torch.cuda.synchronize(device)
+        signal_raised = int(own_pad[slot].item()) == 1
+        hdl.wait_signal(pred, channel=1)
+        torch.cuda.synchronize(device)
+        signal_cleared = int(own_pad[slot].item()) == 0
+        # Without this fence the predecessor can start round 2 and re-raise the
+        # slot before it has been read.
+        dist.barrier(group=pg)
+        hdl.put_signal(succ, channel=1)
+        hdl.wait_signal(pred, channel=1)
+        torch.cuda.synchronize(device)
+        pad_drained = bool(torch.all(symm.get_signal_pad(hdl, rank) == 0).item())
+
         report: dict[str, Any] = {
             "rank": rank,
-            "transport": _cuda_ipc.get_transport(rank).value,
+            "backend": sm.get_active_backend(),
+            "transport": (
+                _cuda_ipc.get_transport(rank).value if backend == "CUDA" else None
+            ),
             "buffer_ptrs_len": [len(h.buffer_ptrs) for h in handles],
             "all_ptrs_nonzero": all(
                 all(p != 0 for p in h.buffer_ptrs) for h in handles
@@ -272,6 +323,11 @@ def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> 
             "sum_first": float(acc[0].item()),
             "sum_all_equal": bool(torch.all(acc == acc[0]).item()),
             "multicast_agreed": len(set(mc_flags)) == 1,
+            "stamps": stamps,
+            "barrier_ok": stamps == [float(p + 100) for p in range(world_size)],
+            "signal_raised": signal_raised,
+            "signal_cleared": signal_cleared,
+            "pad_drained": pad_drained,
         }
 
         dist.barrier(group=pg)
@@ -292,18 +348,28 @@ def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> 
 @pytest.mark.multi_gpu
 @pytest.mark.peer_access
 @pytest.mark.parametrize(
-    "transport", [pytest.param("fabric", marks=pytest.mark.fabric), "fd"]
+    ("backend", "transport"),
+    [
+        pytest.param("CUDA", "fabric", marks=pytest.mark.fabric),
+        ("CUDA", "fd"),
+        ("NCCL", None),
+    ],
 )
-def test_symm_mem_mempool(transport: str, tmp_path: pathlib.Path) -> None:
+def test_symm_mem_mempool(
+    backend: str, transport: str | None, tmp_path: pathlib.Path
+) -> None:
     if transport == "fd" and not _cuda_ipc.cu_device_supports_posix_fd(0):
         pytest.skip("no POSIX-fd handle support on this device")
     world_size = min(torch.cuda.device_count(), 8)
-    reports = _spawn(_worker, world_size, str(tmp_path / "reports.json"), transport)
+    reports = _spawn(
+        _worker, world_size, str(tmp_path / "reports.json"), backend, transport
+    )
 
     expected_sum = float(sum(range(1, world_size + 1)))
     assert len(reports) == world_size
     for r in reports:
         rank = r["rank"]
+        assert r["backend"] == backend, rank
         assert r["transport"] == transport, rank
         assert all(n == world_size for n in r["buffer_ptrs_len"]), rank
         assert r["all_ptrs_nonzero"], rank
@@ -319,6 +385,12 @@ def test_symm_mem_mempool(transport: str, tmp_path: pathlib.Path) -> None:
             f"rank {rank}: cross-rank sum = {r['sum_first']}, want {expected_sum}"
         )
         assert r["multicast_agreed"], f"rank {rank}: ranks disagree on multicast"
+        assert r["barrier_ok"], (
+            f"rank {rank}: peers' stamps not all visible after barrier: {r['stamps']}"
+        )
+        assert r["signal_raised"], f"rank {rank}: predecessor's signal never landed"
+        assert r["signal_cleared"], f"rank {rank}: wait_signal did not reset the slot"
+        assert r["pad_drained"], f"rank {rank}: signal pad not back to zero"
         assert r["peer_alloc_infos_after_free"] == 0, (
             f"rank {rank}: peer state still registered after free_pool"
         )

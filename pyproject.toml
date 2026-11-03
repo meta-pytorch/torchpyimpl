@@ -243,4 +243,5 @@ markers = [
     "multi_gpu: requires two or more CUDA GPUs",
     "peer_access: requires peer access between the GPUs",
     "fabric: requires usable CUDA fabric handles",
+    "sm90: requires compute capability 9.0+ (multimem instructions)",
 ]

@@ -14,10 +14,11 @@ import tempfile
 import threading
 import weakref
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import driver
 
@@ -314,6 +315,50 @@ def test_free_pool_refuses_pool_with_live_tensors(
     assert status is _mempool.FreePoolStatus.IN_USE
     assert 121 in _mempool._pools
     assert backend.peer_calls == 0
+
+
+def _two_rank_group(monkeypatch: pytest.MonkeyPatch, peer: list[str | None]) -> Any:
+    """A two-rank group whose other rank reports ``peer[i]`` in vote ``i``."""
+    votes = iter(peer)
+
+    def all_gather_object(out: list[object], obj: object, group: object) -> None:
+        out[0], out[1] = obj, next(votes)
+
+    monkeypatch.setattr(_mempool.dist, "get_world_size", lambda _group: 2)
+    monkeypatch.setattr(_mempool.dist, "all_gather_object", all_gather_object)
+    return cast(dist.ProcessGroup, object())
+
+
+def test_free_pool_with_group_keeps_pool_if_a_peer_is_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _FakeBackend()
+    monkeypatch.setitem(_mempool._pools, 116, _FakePool())
+    monkeypatch.setattr(_allocator, "_backend_resolver", lambda: backend)
+    group = _two_rank_group(monkeypatch, ["in_use"])
+
+    status = _mempool.free_pool(torch.device("cuda:116"), group)
+
+    assert status is _mempool.FreePoolStatus.IN_USE
+    assert 116 in _mempool._pools
+    assert backend.peer_calls == 0
+
+
+def test_free_pool_with_group_reports_a_peer_incomplete_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _FakeBackend()
+    monkeypatch.setitem(_mempool._pools, 115, _FakePool())
+    monkeypatch.setattr(_allocator, "_backend_resolver", lambda: backend)
+    monkeypatch.setattr(torch.cuda, "device", lambda _idx: nullcontext())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    group = _two_rank_group(monkeypatch, [None, "incomplete"])
+
+    status = _mempool.free_pool(torch.device("cuda:115"), group)
+
+    assert status is _mempool.FreePoolStatus.INCOMPLETE
+    assert 115 not in _mempool._pools
+    assert backend.peer_calls == 1
 
 
 def _mempool_worker(rank: int, result_path: str) -> None:

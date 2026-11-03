@@ -14,6 +14,7 @@ import threading
 from enum import Enum
 
 import torch
+import torch.distributed as dist
 
 from torchpyimpl.distributed.symmetric_memory._allocator import (
     alloc,
@@ -123,15 +124,69 @@ def _drained(allocator: PoolBackend, device: int) -> FreePoolStatus:
     return FreePoolStatus.FREED
 
 
-def free_pool(device: torch.device) -> FreePoolStatus:
+_SEVERITY: dict[FreePoolStatus, int] = {
+    FreePoolStatus.NOTHING_TO_FREE: 0,
+    FreePoolStatus.FREED: 1,
+    FreePoolStatus.IN_USE: 2,
+    FreePoolStatus.INCOMPLETE: 3,
+    FreePoolStatus.CUDA_ERROR: 4,
+}
+
+
+def _agree(
+    group: dist.ProcessGroup,
+    status: FreePoolStatus | None,
+    failing: tuple[FreePoolStatus, ...],
+) -> FreePoolStatus | None:
+    """Return the most severe ``failing`` status of any rank, else ``status``."""
+    gathered: list[object] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(gathered, None if status is None else status.value, group)
+    failed = [
+        FreePoolStatus(s)
+        for s in gathered
+        if s is not None and FreePoolStatus(s) in failing
+    ]
+    return max(failed, key=_SEVERITY.__getitem__) if failed else status
+
+
+def free_pool(
+    device: torch.device, group: dist.ProcessGroup | None = None
+) -> FreePoolStatus:
     """Release the symmetric ``MemPool`` for ``device``.
 
     First, release peer resources in allocation order. This order is the same
     on all ranks. Then, release the pool and its memory. Keep the pool if it is
     in use, if CUDA fails, or if resource cleanup is incomplete. A later call
     can retry cleanup. The returned status tells which of these occurred.
+
+    Without ``group``, each rank decides alone. With ``group``, the ranks agree
+    before the teardown: if one rank cannot free, no rank frees. All ranks
+    return the same status if one of them is ``IN_USE``, ``INCOMPLETE``, or
+    ``CUDA_ERROR``. Pass the group that rendezvoused the pool's tensors: NCCL
+    needs the same windows on every rank. After ``INCOMPLETE``, the ranks can
+    hold different NCCL windows; retry before a new rendezvous on that group.
     """
     idx = _device_index(device)
+    blocked = _blocked(idx)
+    if group is not None:
+        blocked = _agree(
+            group, blocked, (FreePoolStatus.IN_USE, FreePoolStatus.CUDA_ERROR)
+        )
+    if blocked is not None and blocked is not FreePoolStatus.NOTHING_TO_FREE:
+        return blocked
+    status = blocked or _teardown(idx)
+    if group is not None:
+        status = (
+            _agree(
+                group, status, (FreePoolStatus.INCOMPLETE, FreePoolStatus.CUDA_ERROR)
+            )
+            or status
+        )
+    return status
+
+
+def _blocked(idx: int) -> FreePoolStatus | None:
+    """The status if ``free_pool`` must not tear down on this rank, else None."""
     with _lock:
         pool = _pools.get(idx)
     allocator = get_backend()
@@ -146,13 +201,7 @@ def free_pool(device: torch.device) -> FreePoolStatus:
                 idx,
             )
             return FreePoolStatus.CUDA_ERROR
-        released = _release_pending(allocator, idx)
-        logger.info(
-            "retried symmetric MemPool cleanup on cuda:%d (released %d segment(s))",
-            idx,
-            released,
-        )
-        return _drained(allocator, idx)
+        return None
 
     if allocator.should_skip_cleanup(idx):
         logger.warning(
@@ -171,6 +220,21 @@ def free_pool(device: torch.device) -> FreePoolStatus:
             idx,
         )
         return FreePoolStatus.IN_USE
+    return None
+
+
+def _teardown(idx: int) -> FreePoolStatus:
+    with _lock:
+        pool = _pools.get(idx)
+    allocator = get_backend()
+    if pool is None:
+        released = _release_pending(allocator, idx)
+        logger.info(
+            "retried symmetric MemPool cleanup on cuda:%d (released %d segment(s))",
+            idx,
+            released,
+        )
+        return _drained(allocator, idx)
 
     n = _release_peer_resources(allocator, idx)
     if n is None:

@@ -77,10 +77,20 @@ def signal_pad_slots() -> int:
 
 def buffer_offset() -> int:
     """Constant byte offset from an allocation's base (== signal-pad base) to its
-    data buffer: ``round_up(signal_pad_bytes, 128)``. A process-global constant
-    once allocations begin (the pad size is frozen), which is what makes
+    data buffer. The front region is [signal pad | barrier state], as in torch:
+    the pad takes two units of half its size and the multimem barrier's state
+    one, each unit rounded up to 128 bytes. A process-global constant once
+    allocations begin (the pad size is frozen), which is what makes
     ``base + buffer_offset`` a sound O(1) recovery of the data pointer."""
-    return _round_up(signal_pad_bytes(), SIGNAL_PAD_ALIGNMENT)
+    return 3 * _round_up((signal_pad_bytes() + 1) // 2, SIGNAL_PAD_ALIGNMENT)
+
+
+def barrier_state_offset() -> int:
+    """Byte offset from a signal pad to the multimem barrier's state: one
+    arrival counter per channel, apart from the pad, so a pending signal is
+    never counted as an arrival. Groups of two or more ranks have at most
+    ``signal_pad_bytes() // 8`` channels, so the state holds every counter."""
+    return buffer_offset() // 3 * 2
 
 
 def set_signal_pad_size(size: int) -> None:
@@ -195,6 +205,27 @@ class SymmMemHandle:
     world_size: int
     comm_ptr: int  # communicator pointer or synthetic group id used for rendezvous
     data_ptr: int = 0  # the pointer passed to rendezvous; the cache key
+
+    # Signal-pad operations as handle methods, with torch's argument order.
+    # They forward to _api, which imports this module.
+    def barrier(self, channel: int = 0, timeout_ms: int | None = None) -> None:
+        from torchpyimpl.distributed.symmetric_memory import _api
+
+        _api.barrier(self, channel, timeout_ms)
+
+    def put_signal(
+        self, dst_rank: int, channel: int = 0, timeout_ms: int | None = None
+    ) -> None:
+        from torchpyimpl.distributed.symmetric_memory import _api
+
+        _api.put_signal(self, dst_rank, channel, timeout_ms)
+
+    def wait_signal(
+        self, src_rank: int, channel: int = 0, timeout_ms: int | None = None
+    ) -> None:
+        from torchpyimpl.distributed.symmetric_memory import _api
+
+        _api.wait_signal(self, src_rank, channel, timeout_ms)
 
 
 # === the shared, backend-agnostic allocator ===================================
@@ -520,6 +551,16 @@ class SymmetricMemoryAllocatorBase:
                 f"0x{buffer_ptr:x}"
             )
 
+        with rec.reg_lock:
+            stale = rec.per_comm.get(comm_ptr)
+            if stale is not None and not self.peers_alive(stale):
+                # The peer state died with its group, and a new communicator
+                # can have the same address.
+                del rec.per_comm[comm_ptr]
+                with self._lock:
+                    for k in [k for k in rec.handles if k[1] == comm_ptr]:
+                        del rec.handles[k]
+
         key = (buffer_ptr, comm_ptr)
         with self._lock:
             cached = rec.handles.get(key)
@@ -634,13 +675,17 @@ class SymmetricMemoryAllocatorBase:
         Idempotent."""
         return CleanupStatus.CLEANED
 
+    def peers_alive(self, pai: _PeerAllocInfo) -> bool:
+        """False if the peer state is gone with its group (backend override)."""
+        return True
+
     def should_skip_cleanup(self, device: int) -> bool:
         return should_skip_cuda_cleanup(device)
 
 
 # === backend registry + standalone API ========================================
 
-_BACKENDS: tuple[str, ...] = ("CUDA",)
+_BACKENDS: tuple[str, ...] = ("CUDA", "NCCL")
 _active_backend: str = "CUDA"
 _allocators: dict[str, SymmetricMemoryAllocatorBase] = {}
 _allocators_lock: threading.Lock = threading.Lock()
@@ -655,6 +700,12 @@ def _build_allocator(name: str) -> SymmetricMemoryAllocatorBase:
         )
 
         return CUDAIPCAllocator()
+    if name == "NCCL":
+        from torchpyimpl.distributed.symmetric_memory.backends._nccl import (
+            NCCLAllocator,
+        )
+
+        return NCCLAllocator()
     raise ValueError(f"symmetric memory backends are {_BACKENDS}, got {name!r}")
 
 
@@ -735,7 +786,8 @@ def rendezvous(
 ) -> SymmMemHandle:
     """Collective. Build a :class:`SymmMemHandle` for ``buffer_ptr`` (raw-pointer
     entry point; the MemPool path calls the allocator directly). ``group`` is
-    required by the CUDA-IPC backend for the IPC-handle exchange."""
+    required by the CUDA-IPC backend for the IPC-handle exchange; the NCCL
+    backend uses ``comm_ptr``."""
     return get_allocator_instance().rendezvous(
         buffer_ptr, comm_ptr, rank, world_size, device, size=size, group=group
     )

@@ -7,22 +7,35 @@
 from __future__ import annotations
 
 import logging
+import weakref
 
 import torch
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import GroupName
 
-from torchpyimpl.distributed.symmetric_memory import _mempool, _symm_mem
-from torchpyimpl.distributed.symmetric_memory._comm import get_group_info
-from torchpyimpl.distributed.symmetric_memory._symm_mem import signal_pad_bytes
+from torchpyimpl.distributed.symmetric_memory import (
+    _mempool,
+    _multimem,
+    _signal,
+    _symm_mem,
+)
+from torchpyimpl.distributed.symmetric_memory._comm import get_group_info, GroupInfo
+from torchpyimpl.distributed.symmetric_memory._symm_mem import (
+    barrier_state_offset,
+    signal_pad_bytes,
+    signal_pad_slots,
+)
 
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 
 def set_backend(name: str) -> None:
-    """Select the symmetric-memory backend. Available: ``"CUDA"`` (default),
-    CUDA VMM + IPC over fabric handles or POSIX fds.
+    """Select the symmetric-memory backend:
+
+    * ``"CUDA"`` (default) — CUDA VMM + IPC over fabric handles or POSIX fds.
+    * ``"NCCL"`` — ``ncclMemAlloc`` + ``ncclCommWindowRegister`` symmetric
+      windows on the process group's communicator.
 
     Must be called before the first symmetric allocation."""
     _symm_mem.set_active_backend(name)
@@ -82,6 +95,7 @@ def rendezvous(
     # otherwise comm_ptr is a synthetic per-group cache key.
     allocator = _symm_mem.get_allocator_instance()
     info = get_group_info(group, device, require_comm=allocator.requires_nccl_comm)
+    _remember_group_timeout(info, group)
     return allocator.rendezvous(
         int(tensor.data_ptr()),
         info.comm_ptr,
@@ -92,11 +106,40 @@ def rendezvous(
     )
 
 
-def free_pool(device: torch.device) -> _mempool.FreePoolStatus:
-    """Free the symmetric pool of ``device``. Each rank decides the status
-    alone, so the caller must agree on it across ranks. Handles from earlier
-    rendezvous calls are not valid after the pool is freed."""
-    return _mempool.free_pool(device)
+# comm_ptr -> (timeout_ms, weakref to its group). Each rendezvous overwrites the
+# entry, so a reused communicator address gets the timeout of its new group.
+_group_timeout_ms: dict[int, tuple[int, weakref.ref[dist.ProcessGroup]]] = {}
+
+
+def _remember_group_timeout(info: GroupInfo, group: dist.ProcessGroup) -> None:
+    _group_timeout_ms[info.comm_ptr] = (info.timeout_ms, weakref.ref(group))
+
+
+def _resolve_timeout(handle: _symm_mem.SymmMemHandle, timeout_ms: int | None) -> int:
+    """``None`` uses the rendezvous group's timeout; ``0`` is unbounded, as in
+    torch."""
+    if timeout_ms is not None:
+        if timeout_ms < 0:
+            raise ValueError(f"timeout_ms must be >= 0 or None, got {timeout_ms}")
+        return timeout_ms
+    entry = _group_timeout_ms.get(handle.comm_ptr)
+    if entry is None:
+        return 0
+    ms, group_ref = entry
+    if group_ref() is None:
+        del _group_timeout_ms[handle.comm_ptr]
+        return 0
+    return ms
+
+
+def free_pool(
+    device: torch.device, group: dist.ProcessGroup | None = None
+) -> _mempool.FreePoolStatus:
+    """Free the symmetric pool of ``device``. With ``group``, the ranks agree
+    before the teardown (see :func:`_mempool.free_pool`); without it, each rank
+    decides alone. Handles from earlier rendezvous calls are not valid after
+    the pool is freed."""
+    return _mempool.free_pool(device, group)
 
 
 # === handle accessors =========================================================
@@ -200,8 +243,102 @@ def has_multicast_support(handle: _symm_mem.SymmMemHandle) -> bool:
     comparing ``multicast_ptr`` yourself.
 
     The pointer it guards is addressable only through ``multimem.*``
-    instructions."""
+    instructions; see :mod:`torchpyimpl.distributed.symmetric_memory._multimem`."""
     return handle.multicast_ptr != 0
+
+
+# === signal-pad synchronization ==============================================
+
+
+def _check_signal_args(
+    handle: _symm_mem.SymmMemHandle, peer_rank: int, channel: int, what: str
+) -> None:
+    """Reject out-of-range peers/channels on the host. A bad slot index would
+    otherwise be an out-of-bounds atomic on a peer's pad, or a kernel spinning
+    on a slot nobody signals."""
+    if channel < 0:
+        raise ValueError(f"{what}: channel must be non-negative, got {channel}")
+    slots = signal_pad_slots()
+    needed = (channel + 1) * handle.world_size
+    if needed > slots:
+        raise ValueError(
+            f"{what}: channel {channel} needs {needed} uint32 signal-pad slots "
+            f"for world_size {handle.world_size}, but the pad holds {slots} "
+            f"({signal_pad_bytes()} bytes). Raise it with set_signal_pad_size() "
+            "before the first allocation."
+        )
+    _check_peer(handle, peer_rank, what)
+
+
+def barrier(
+    handle: _symm_mem.SymmMemHandle, channel: int = 0, timeout_ms: int | None = None
+) -> None:
+    """Barrier across the handle's ranks on ``channel``: the multicast barrier
+    when the allocation has a multicast signal pad, otherwise the all-to-all
+    CAS barrier. ``timeout_ms=None`` uses the rendezvous group's timeout
+    (unbounded if it has none); ``0`` is unbounded."""
+    if handle.world_size <= 1:
+        return
+    _check_signal_args(handle, handle.rank, channel, "barrier")
+    timeout = _resolve_timeout(handle, timeout_ms)
+    with torch.cuda.device(_handle_device(handle)):
+        if handle.multicast_signal_pad_ptr:
+            state = barrier_state_offset()
+            _multimem.barrier(
+                handle.multicast_signal_pad_ptr + state,
+                handle.signal_pad_ptr + state,
+                handle.world_size,
+                channel,
+                timeout,
+            )
+            return
+        _signal.barrier(
+            handle.signal_pad_ptrs_tensor,
+            handle.rank,
+            handle.world_size,
+            channel,
+            timeout,
+        )
+
+
+def put_signal(
+    handle: _symm_mem.SymmMemHandle,
+    dst_rank: int,
+    channel: int = 0,
+    timeout_ms: int | None = None,
+) -> None:
+    """Raise this rank's slot in ``dst_rank``'s pad on ``channel``; blocks
+    until a previous signal on that slot has been consumed."""
+    _check_signal_args(handle, dst_rank, channel, "put_signal")
+    with torch.cuda.device(_handle_device(handle)):
+        _signal.put_signal(
+            handle.signal_pad_ptrs_tensor,
+            handle.rank,
+            dst_rank,
+            handle.world_size,
+            channel,
+            _resolve_timeout(handle, timeout_ms),
+        )
+
+
+def wait_signal(
+    handle: _symm_mem.SymmMemHandle,
+    src_rank: int,
+    channel: int = 0,
+    timeout_ms: int | None = None,
+) -> None:
+    """Wait for ``src_rank``'s signal in this rank's pad on ``channel`` and
+    reset the slot."""
+    _check_signal_args(handle, src_rank, channel, "wait_signal")
+    with torch.cuda.device(_handle_device(handle)):
+        _signal.wait_signal(
+            handle.signal_pad_ptrs_tensor,
+            handle.rank,
+            src_rank,
+            handle.world_size,
+            channel,
+            _resolve_timeout(handle, timeout_ms),
+        )
 
 
 def _peer_tensor(
