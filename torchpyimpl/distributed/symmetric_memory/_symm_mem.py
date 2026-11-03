@@ -194,6 +194,7 @@ class SymmMemHandle:
     rank: int
     world_size: int
     comm_ptr: int  # communicator pointer or synthetic group id used for rendezvous
+    data_ptr: int = 0  # the pointer passed to rendezvous; the cache key
 
 
 # === the shared, backend-agnostic allocator ===================================
@@ -543,7 +544,7 @@ class SymmetricMemoryAllocatorBase:
                 pai = self.establish_peers(rec, comm_ptr, world_size, device, group)
                 rec.per_comm[comm_ptr] = pai
             handle = self._make_handle(
-                rec, pai, offset, comm_ptr, rank, world_size, size
+                rec, pai, buffer_ptr, offset, comm_ptr, rank, world_size, size
             )
             with self._lock:
                 if rec.retired:
@@ -564,6 +565,7 @@ class SymmetricMemoryAllocatorBase:
         self,
         rec: AllocRecord,
         pai: _PeerAllocInfo,
+        data_ptr: int,
         offset: int,
         comm_ptr: int,
         rank: int,
@@ -586,6 +588,7 @@ class SymmetricMemoryAllocatorBase:
             rank=rank,
             world_size=world_size,
             comm_ptr=comm_ptr,
+            data_ptr=data_ptr,
         )
 
     def cache_stats(self) -> dict[str, int]:
