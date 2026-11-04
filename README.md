@@ -1,10 +1,3 @@
-<p align="left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/torch-pyimpl-logo-dark.png">
-    <img width="55%" src="docs/assets/torch-pyimpl-logo.png" alt="torchpyimpl">
-  </picture>
-</p>
-
 # torchpyimpl
 
 torchpyimpl provides pure-Python implementations of PyTorch GPU and distributed
