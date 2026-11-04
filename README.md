@@ -21,6 +21,8 @@ on regular `torch.Tensor`s, and require no C++ build.
 |---|---|---|
 | Symmetric memory | `torchpyimpl.distributed.symmetric_memory` | In progress |
 
+Design notes: [`docs/symmetric_memory`](docs/symmetric_memory/README.md).
+
 ## Prerequisites
 
 - Python 3.12 through 3.14
@@ -61,6 +63,41 @@ Run tests:
 uv run pytest tests/                    # GPU tests are skipped without GPUs
 uv run pytest tests/ -m "not gpu and not multi_gpu"
 ```
+
+## Benchmarks
+
+`benchmarks/symmetric_memory/bench.py` times allocation, cold rendezvous
+(allocation + cross-rank setup) and cached rendezvous for one backend, and
+optionally torch's native symmetric memory for the same backend. Results are
+p20/p50/p80 wall-clock per buffer size; the table shows rank 0 and the raw
+per-rank JSON is written under `$TORCHPYIMPL_BENCH_DIR` (default
+`/tmp/torchpyimpl-bench`).
+
+```bash
+# One configuration (default: CUDA backend, torchpyimpl, cached rendezvous, all GPUs)
+uv run python benchmarks/symmetric_memory/bench.py
+uv run python benchmarks/symmetric_memory/bench.py --backend NCCL --with-alloc-sweeps
+uv run python benchmarks/symmetric_memory/bench.py --backend CUDA --measure torch
+uv run python benchmarks/symmetric_memory/bench.py --world-size 4 --min-log2 12 --max-log2 20
+
+# All four configurations (torch CUDA, torchpyimpl CUDA, torchpyimpl NCCL,
+# torch NCCL), each in its own process
+./benchmarks/symmetric_memory/compare.sh --with-alloc-sweeps
+RANKS="2 4 8" ./benchmarks/symmetric_memory/compare.sh      # sweep world size
+```
+
+| flag | meaning |
+|---|---|
+| `--backend CUDA\|NCCL` | symmetric-memory backend (default `CUDA`) |
+| `--measure ours\|torch\|both` | time torchpyimpl, torch's native implementation, or both in one process (default `ours`) |
+| `--with-alloc-sweeps` | also run the allocation and cold-rendezvous sweeps |
+| `--world-size N` | ranks to use (default: all visible GPUs, up to 8) |
+| `--min-log2` / `--max-log2` | buffer sizes as powers of two (default 4 KiB to 1 GiB) |
+
+`compare.sh` runs one process per configuration because torch's NCCL backend and
+the torchpyimpl NCCL backend register windows on the same communicator and would
+contend if measured together. Extra arguments are passed to every `bench.py`
+run.
 
 ## Contributing
 
