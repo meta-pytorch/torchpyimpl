@@ -65,6 +65,20 @@ The handle also carries `group_name`, the group it was rendezvoused on, as
 torch's `hdl.group_name`. A buffer rendezvoused on two groups has two handles,
 one per group. The handle holds its group weakly.
 
+## CUDA graphs
+
+Allocation and the first rendezvous of an allocation on a group cannot be
+captured, and raise while the current stream is capturing a graph, as in torch.
+Allocation maps the block, zeroes the signal pad and synchronizes the device.
+`empty()` reaches it only on a pool miss. The first rendezvous exchanges
+handles across ranks. Allocate and rendezvous before starting capture.
+
+Later rendezvous calls on the same allocation and group reuse the cached peer
+state and are capture-safe. That includes new views of the allocation. So are
+`barrier`, `put_signal` and `wait_signal`. Every rank must replay a captured
+graph the same number of times, because each replay performs that rank's side
+of the synchronization.
+
 ## The handle contract
 
 | accessor | returns | offset convention |

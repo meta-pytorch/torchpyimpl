@@ -83,6 +83,16 @@ def _device_index(device: torch.device | int | None) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+def check_not_capturing(device: int, op: str, hint: str) -> None:
+    with torch.cuda.device(device):
+        capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        raise RuntimeError(
+            f"{op}: not supported while the current CUDA stream is capturing "
+            f"a graph. {hint}"
+        )
+
+
 @dataclass
 class _PeerAllocInfo:
     window: object
@@ -178,6 +188,13 @@ class SymmetricMemoryAllocatorBase:
         stream: int | None = None,
     ) -> int:
         idx = _device_index(device)
+        check_not_capturing(
+            idx,
+            "symmetric memory allocation",
+            "Allocation maps the block, zeroes the signal pad and synchronizes "
+            "the device. Allocate the buffer with empty() before starting "
+            "capture.",
+        )
         global _signal_pad_size, _pad_frozen
         _signal_pad_size = signal_pad_bytes()
         _pad_frozen = True
@@ -450,6 +467,14 @@ class SymmetricMemoryAllocatorBase:
         with rec.reg_lock:
             pai = rec.per_comm.get(comm_ptr)
             if pai is None:
+                check_not_capturing(
+                    rec.device,
+                    "the first rendezvous of a symmetric allocation",
+                    "It exchanges handles across ranks and synchronizes the "
+                    "device. Call rendezvous(tensor, group) once before "
+                    "starting capture; later calls on the same buffer reuse "
+                    "the cached handle.",
+                )
                 pai = self.establish_peers(rec, comm_ptr, world_size, device, group)
                 rec.per_comm[comm_ptr] = pai
             handle = self._make_handle(

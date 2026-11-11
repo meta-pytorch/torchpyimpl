@@ -37,6 +37,7 @@ def _unfrozen_signal_pad(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sm, "_signal_pad_size", None)
     monkeypatch.setattr(sm, "_pad_frozen", False)
     monkeypatch.setattr(torch.cuda, "device", _fake_cuda_device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
 
 def test_front_region_matches_torch() -> None:
@@ -331,3 +332,22 @@ def test_rendezvous_rejects_uncovered_ptr(monkeypatch: pytest.MonkeyPatch) -> No
     allocator, buf = _allocator_with_one_alloc(monkeypatch)
     with pytest.raises(KeyError, match="no symmetric allocation covers"):
         allocator.rendezvous(buf - 8, 11, 0, 1, torch.device("cpu"))
+
+
+def test_capture_rejects_alloc_and_first_rendezvous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator, buf = _allocator_with_one_alloc(monkeypatch)
+    device = torch.device("cpu")
+    cached = allocator.rendezvous(buf, 11, 0, 1, device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="capturing a graph"):
+        allocator.alloc(_NBYTES, 0)
+    with pytest.raises(RuntimeError, match="before starting capture"):
+        allocator.rendezvous(buf, 12, 0, 1, device)
+
+    assert allocator.rendezvous(buf, 11, 0, 1, device) is cached
+    assert allocator.rendezvous(buf + 64, 11, 0, 1, device).offset == 64
+    stats = allocator.cache_stats()
+    assert stats["records"] == 1 and stats["peer_alloc_infos"] == 1
