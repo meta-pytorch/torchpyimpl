@@ -111,6 +111,16 @@ the torchpyimpl NCCL backend register windows on the same communicator and would
 contend if measured together. Extra arguments are passed to every `bench.py`
 run.
 
+`benchmarks/symmetric_memory/bench_signal.py` times `barrier`, the CAS barrier
+and a `put_signal`/`wait_signal` ring per operation (host issue time, and issue
+plus synchronize), with and without the per-group stream ordering, and with it
+alternating between two streams.
+
+```bash
+uv run python benchmarks/symmetric_memory/bench_signal.py
+uv run python benchmarks/symmetric_memory/bench_signal.py --backend NCCL --world-size 4
+```
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
