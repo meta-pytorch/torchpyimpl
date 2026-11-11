@@ -106,7 +106,42 @@ count as an arrival, and a later `wait_signal` would never see its value.
   rank's pad, or a spin on a slot nobody will signal.
 - **Stream-ordered.** All three are ordinary launches on the current stream, so
   they order against surrounding work like any kernel and are safe to capture in
-  a CUDA graph. A first rendezvous is not — it is collective and synchronizes
-  the device (see [`api.md`](api.md#cuda-graphs)).
+  a CUDA graph. They also run in issue order across streams within their group
+  (see below). A first rendezvous is not capture-safe — it is collective and
+  synchronizes the device (see [`api.md`](api.md#cuda-graphs)).
 - **No communicator involvement.** Peer pads are plain device pointers, so this
   works the same on the CUDA-IPC and NCCL backends.
+
+## Stream ordering
+
+Two signal-pad operations of one group running at once on different streams
+can take each other's signals: a barrier on stream B consumes the round meant
+for a barrier on stream A and finishes before every rank arrived. So `barrier`, `put_signal` and `wait_signal` run in issue
+order across streams for each process group and device, as torch's
+`GroupStreamGuard` orders its CUDA backend (`_stream_order.py`).
+
+- **How.** The guard keeps, per (group, device), the stream of the last
+  operation and an event recorded just after its launch. An operation on a
+  different stream first waits on that event. It waits for the previous pad
+  kernel only, not for work queued behind it. On the same stream it costs a
+  lock and a comparison. The lock spans the launch, so operations issued from
+  several host threads are ordered too.
+- **Both backends.** Torch leaves the NCCL backend's `put_signal` and
+  `wait_signal` unguarded because they use NCCL's own signals. Here both
+  backends run the same kernels on the same pad, so all three operations are
+  guarded on both.
+- **Per group, not per allocation.** Pads are per allocation, so this is
+  stricter than the slots require; it matches torch. Operations of different
+  groups are not ordered.
+- **Graph capture.** Under capture the record and wait become graph edges. An
+  event can only be waited on from the capture it was recorded in, so eager
+  operations are ordered among themselves, and so are the operations of the
+  capture in progress. Eager operations stay ordered when a capture runs
+  between them. Captured operations are not ordered against eager ones, and a
+  replay is not ordered against eager operations or other replays: order
+  replays yourself.
+- **Lifetime.** The state is held weakly by the group object: it dies with the
+  group, and a later group reusing the name starts fresh. A handle without a
+  live group (a raw-pointer rendezvous without one) is not ordered.
+- **Not covered.** Custom kernels on a raw `get_signal_pad()` view. Issue those
+  from one stream per group, or order their streams explicitly.
