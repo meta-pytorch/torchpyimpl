@@ -10,6 +10,7 @@ import gc
 import json
 import os
 import socket
+import threading
 import time
 from contextlib import closing
 from typing import Any, TYPE_CHECKING
@@ -306,3 +307,157 @@ def test_ordering_structure(backend: str, tmp_path: pathlib.Path) -> None:
         assert r["eager after captures"] == [False, True], rank
         assert r["state while group lives"], rank
         assert r["states dropped with group"] == 1, rank
+
+
+def _cycles_per_ms() -> float:
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+    torch.cuda._sleep(1_000_000)
+    start.record()
+    torch.cuda._sleep(10_000_000)
+    end.record()
+    end.synchronize()
+    return 10_000_000 / start.elapsed_time(end)
+
+
+def _peer_value(hdl: symm.SymmMemHandle, peer: int) -> float:
+    torch.cuda.synchronize()
+    dist.barrier()
+    buf = symm.get_buffer(hdl, peer, (_N,), torch.float32)
+    value = float(buf[0]) if bool((buf == buf[0]).all()) else float("nan")
+    dist.barrier()
+    return value
+
+
+def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) -> None:
+    _init(rank, world_size, port, backend)
+    delay = int(100 * _cycles_per_ms())
+    world = dist.group.WORLD
+    nxt, prv = (rank + 1) % world_size, (rank - 1) % world_size
+    t = symm.empty(_N, dtype=torch.float32, device="cuda")
+    hdl = symm.rendezvous(t, world)
+    t.fill_(0.0)
+    hdl.put_signal(nxt)
+    hdl.wait_signal(prv)
+    hdl.barrier()
+    torch.cuda.synchronize()
+    r: dict[str, Any] = {"rank": rank}
+    stream_a, stream_b = torch.cuda.Stream(), torch.cuda.Stream()
+
+    with torch.cuda.stream(stream_a):
+        if rank == 0:
+            torch.cuda._sleep(delay)
+        t.fill_(rank + 1.0)
+        hdl.barrier()
+    with torch.cuda.stream(stream_b):
+        hdl.barrier()
+        t.fill_(rank + 10.0)
+    r["barrier two streams"] = _peer_value(hdl, nxt) == nxt + 10.0
+
+    with torch.cuda.stream(stream_a):
+        if rank == 0:
+            torch.cuda._sleep(delay)
+        t.fill_(rank + 1.0)
+        hdl.put_signal(nxt)
+        hdl.wait_signal(prv)
+    with torch.cuda.stream(stream_b):
+        hdl.put_signal(nxt)
+        hdl.wait_signal(prv)
+        t.fill_(rank + 100.0)
+    r["put_wait two streams"] = _peer_value(hdl, prv) == prv + 100.0
+
+    sleep_done, b_done = torch.cuda.Event(), torch.cuda.Event()
+    with torch.cuda.stream(stream_a):
+        hdl.barrier()
+        torch.cuda._sleep(int(2000 * _cycles_per_ms()))
+        sleep_done.record()
+    with torch.cuda.stream(stream_b):
+        hdl.barrier()
+        b_done.record()
+    b_done.synchronize()
+    r["waits on the pad kernel only"] = not sleep_done.query()
+    torch.cuda.synchronize()
+
+    errors: list[str] = []
+    start = threading.Barrier(2, timeout=30)
+    first_done = torch.cuda.Event()
+    first_recorded = threading.Event()
+
+    def first_thread() -> None:
+        try:
+            with torch.cuda.stream(stream_a):
+                start.wait()
+                if rank == 0:
+                    torch.cuda._sleep(delay)
+                hdl.barrier()
+                t.fill_(rank + 1.0)
+                first_done.record()
+        except Exception as e:
+            errors.append(repr(e))
+        finally:
+            first_recorded.set()
+
+    def second_thread() -> None:
+        try:
+            with torch.cuda.stream(stream_b):
+                start.wait()
+                hdl.barrier()
+                first_recorded.wait(timeout=30)
+                stream_b.wait_event(first_done)
+                t.fill_(rank + 10.0)
+        except Exception as e:
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=f) for f in (first_thread, second_thread)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+    r["threads finished"] = not any(th.is_alive() for th in threads)
+    r["thread errors"] = errors
+    r["two threads"] = _peer_value(hdl, nxt) == nxt + 10.0
+
+    replays = 4
+    counter = torch.zeros(1, device="cuda")
+    main, side = torch.cuda.Stream(), torch.cuda.Stream()
+    main.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=main):
+        counter.add_(1.0)
+        side.wait_stream(main)
+        if rank == 0:
+            torch.cuda._sleep(delay)
+        t.fill_(1.0)
+        hdl.barrier()
+        with torch.cuda.stream(side):
+            hdl.barrier()
+            t.copy_(counter.expand(_N) * 100.0 + rank)
+        main.wait_stream(side)
+    for _ in range(replays):
+        graph.replay()
+    r["graph forked streams"] = _peer_value(hdl, nxt) == replays * 100.0 + nxt
+    pad = symm.get_signal_pad(hdl, rank)
+    r["pad clean after replays"] = bool((pad == 0).all())
+    _report(r, out)
+    dist.destroy_process_group()
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.peer_access
+@pytest.mark.parametrize("backend", ["CUDA", "NCCL"])
+def test_ordering_keeps_rounds_apart(backend: str, tmp_path: pathlib.Path) -> None:
+    for r in _spawn(_data_worker, backend, tmp_path):
+        rank = r["rank"]
+        assert r["threads finished"], f"rank {rank}: a thread hung"
+        assert not r["thread errors"], f"rank {rank}: {r['thread errors']}"
+        for key in (
+            "barrier two streams",
+            "put_wait two streams",
+            "waits on the pad kernel only",
+            "two threads",
+            "graph forked streams",
+            "pad clean after replays",
+        ):
+            assert r[key], f"rank {rank}: {key}"
