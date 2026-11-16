@@ -16,8 +16,6 @@ if TYPE_CHECKING:
 
 
 class PoolBackend(Protocol):
-    """Define the backend operations that a symmetric memory pool uses."""
-
     def alloc(self, size: int, device: int, stream: int) -> int: ...
 
     def free(self, buffer_ptr: int, size: int, device: int, stream: int) -> None: ...
@@ -37,11 +35,6 @@ _backend_resolver: Callable[[], PoolBackend] | None = None
 
 
 def set_backend_resolver(resolver: Callable[[], PoolBackend]) -> None:
-    """Register the callable that returns the active :class:`PoolBackend`.
-
-    Each allocation and free operation calls the resolver. The active backend
-    can change without rebuilding the ``MemPool``.
-    """
     global _backend_resolver
     _backend_resolver = resolver
 

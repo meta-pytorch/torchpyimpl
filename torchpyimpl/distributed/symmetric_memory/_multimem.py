@@ -25,15 +25,12 @@ from cutlass._mlir.dialects import llvm
 
 AddressSpace = cute.AddressSpace
 
-_VEC: int = 4  # multimem.st.v4.f32 stores 4 floats (16 bytes) per thread
+_VEC: int = 4
 _THREADS: int = 128
 _INT32_MAX: int = 2**31 - 1
 
-# ``.relaxed.sys`` so the store is visible to peer GPUs (cutlass's multimem_st
-# emits ``.weak`` with no scope).
 _ST_V4_PTX: str = "multimem.st.relaxed.sys.global.v4.f32 [$0], {$1, $2, $3, $4};"
 
-# One multicast add reaches every rank's pad.
 _RED_ADD1_PTX: str = "multimem.red.release.sys.global.add.u32 [$0], 1;"
 
 
@@ -145,9 +142,6 @@ def _stream() -> cuda_driver.CUstream:
 
 @cache
 def _compiled_fill(threads: int, device: int) -> Any:
-    # Keyed only on bounded values. The grid extent is a runtime argument, not a
-    # Constexpr: keying on it would recompile — and cache a variant forever —
-    # for every distinct size a caller happens to fill.
     return cute.compile(
         _launch_fill, Int64(0), Int32(0), Int32(0), Int32(0), threads, _stream()
     )
@@ -174,14 +168,6 @@ def barrier(
     channel: int,
     timeout_ms: int = 0,
 ) -> None:
-    """Multicast barrier over the barrier state (see
-    :func:`_symm_mem.barrier_state_offset`), not the signal pad.
-
-    Each rank adds 1 to the channel's counter through the multicast address —
-    one instruction that lands in every rank's state — then waits for its own
-    copy to reach ``world_size``. :func:`_signal.barrier` is the equivalent for
-    allocations with no multicast mapping.
-    """
     if multicast_state_ptr == 0:
         raise ValueError("multimem barrier on a null multicast barrier state")
     _compiled_barrier(world_size, timeout_ms > 0, torch.cuda.current_device())(
@@ -194,17 +180,6 @@ def barrier(
 
 
 def fill(multicast_ptr: int, numel: int, value: float) -> None:
-    """Broadcast float32 ``value`` across ``numel`` elements at ``multicast_ptr``.
-
-    One ``multimem.st`` per 4 elements, so the store lands in *every* rank's
-    physical buffer rather than only the caller's. ``numel`` must be a multiple
-    of 4 and ``multicast_ptr`` 16-byte aligned, which the v4 store requires. A
-    handle from a view can have an unaligned ``multicast_ptr``.
-
-    Stream-ordered like any launch, so it orders against surrounding work — but
-    it is one-sided, so callers still need their own cross-rank fence before
-    reading the result on a peer.
-    """
     if numel % _VEC:
         raise ValueError(f"multimem fill needs numel % {_VEC} == 0, got {numel}")
     if multicast_ptr == 0:
@@ -214,7 +189,7 @@ def fill(multicast_ptr: int, numel: int, value: float) -> None:
             f"multimem fill needs a 16-byte aligned pointer, got 0x{multicast_ptr:x}"
         )
     if numel == 0:
-        return  # a zero-block grid is rejected by the driver, not a no-op
+        return
     n_vec = numel // _VEC
     if n_vec > _INT32_MAX:
         raise ValueError(f"multimem fill supports at most {_INT32_MAX * _VEC} elements")

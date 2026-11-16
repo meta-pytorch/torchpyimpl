@@ -41,7 +41,6 @@ def test_cuda_ipc_transport_env_is_validated(
 
 
 def _peer(host: str, transport: IpcHandleType, device: int = 0) -> dict[str, object]:
-    """One rank's rendezvous payload, for the _validate tests."""
     return {
         "size": 4096,
         "device": device,
@@ -63,7 +62,6 @@ def test_posix_fd_transport_rejects_a_multi_host_group() -> None:
             4096,
             IpcHandleType.POSIX_FD,
         )
-    # Fabric handles cross hosts, so the same group is accepted.
     assert (
         validate(
             [

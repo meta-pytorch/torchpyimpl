@@ -33,8 +33,6 @@ _N_ELEMS = 64
 _ROUNDS = 5
 _CHANNELS = 4
 _SENTINEL = -1.0
-# ~0.3 s on an H100: long enough that a barrier which does not wait reads the
-# sentinel, short enough not to dominate the test.
 _DELAY_CYCLES = 500_000_000
 
 
@@ -72,7 +70,6 @@ def test_multimem_kernels_are_named() -> None:
     fill = _only_symbol(_multimem._compiled_fill(32, 0))
     assert "torchpyimpl_multimem_barrier_kernel" in barrier, barrier
     assert "torchpyimpl_multimem_fill_kernel" in fill, fill
-    # The CAS and multimem barriers must be distinguishable in a trace.
     cas = _only_symbol(_signal._compiled_barrier(2, 0, 32, True, 0))
     assert barrier != cas, barrier
 
@@ -86,9 +83,6 @@ def _free_port() -> int:
 def _ordering_holds(
     hdl: symm.SymmMemHandle, rank: int, world_size: int, stamp: float, pg: Any
 ) -> bool:
-    """Stamp our own buffer, barrier, then read every peer's. Rank 0 sleeps on
-    the GPU first, so a barrier that does not wait reads its sentinel."""
-    # Peers may still be reading this buffer from a previous step.
     dist.barrier(group=pg)
     mine = symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32)
     mine.fill_(_SENTINEL)
@@ -152,22 +146,16 @@ def _worker(
             report["mc_ordering"] = _ordering_holds(hdl, rank, world_size, 100.0, pg)
             report["routed_multimem"] = calls["multimem"]
 
-            # The kernel subtracts world_size rather than zeroing, so repeated
-            # rounds on one channel prove the counter was left reusable.
             for _ in range(_ROUNDS):
                 hdl.barrier()
             torch.cuda.synchronize(device)
 
-            # channel is a runtime argument: all channels share one compile.
             _multimem._compiled_barrier.cache_clear()
             for ch in range(_CHANNELS):
                 hdl.barrier(channel=ch)
             torch.cuda.synchronize(device)
             report["compiles"] = _multimem._compiled_barrier.cache_info().currsize
 
-            # A pending signal must not count as a barrier arrival. Rank 0
-            # signals rank 1 and enters the barrier; rank 1 consumes the signal
-            # only after rank 0's arrival has landed, then enters the barrier.
             dist.barrier(group=pg)
             if rank == 1:
                 torch.cuda._sleep(_DELAY_CYCLES)
@@ -178,7 +166,6 @@ def _worker(
             torch.cuda.synchronize(device)
             report["signal_then_barrier_ok"] = True
 
-            # Force the CAS fallback on the same (cached) handle.
             mc_pad = hdl.multicast_signal_pad_ptr
             hdl.multicast_signal_pad_ptr = 0
             before_cas = calls["cas"]
@@ -189,9 +176,7 @@ def _worker(
         finally:
             _multimem.barrier, _signal.barrier = real_mm, real_cas
 
-        # Multimem broadcast: rank 0 stores through the multicast pointer and
-        # every rank must read the value from its own physical buffer.
-        dist.barrier(group=pg)  # peers may still be reading the CAS stamps
+        dist.barrier(group=pg)
         mine = symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32)
         mine.zero_()
         torch.cuda.synchronize(device)

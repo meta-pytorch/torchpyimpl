@@ -24,7 +24,6 @@ def test_set_backend_validation() -> None:
 
 
 def test_default_signal_pad_size_matches_torch() -> None:
-    # torch's default: symm_max_nblocks(32) * max_p2p_domain(72) * 4.
     assert symm.get_signal_pad_size() == 32 * 72 * 4
 
 

@@ -22,7 +22,7 @@ from cuda.bindings import driver
 
 _OK = driver.CUresult.CUDA_SUCCESS
 _FABRIC = driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-_MAX_RANKS = 8  # multi-GPU tests use min(device_count, 8) ranks
+_MAX_RANKS = 8
 
 
 @functools.cache
@@ -43,8 +43,6 @@ def _sm90() -> bool:
 
 @functools.cache
 def _fabric_handles() -> bool:
-    # Create, export, and import a fabric handle on GPU 0, as PyTorch's
-    # isFabricSupported does.
     (err,) = driver.cuInit(0)
     if err != _OK:
         return False
@@ -85,7 +83,7 @@ _PROBES = {
 
 def pytest_collection_modifyitems(config, items):
     if torch.cuda.device_count() < 1:
-        return  # The root conftest skips the GPU tests.
+        return
     for item in items:
         for name, (probe, reason) in _PROBES.items():
             if item.get_closest_marker(name) is not None and not probe():

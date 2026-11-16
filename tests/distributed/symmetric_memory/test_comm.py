@@ -53,9 +53,9 @@ def _comm_worker(
         pg = dist.new_group(ranks=list(range(world_size)), backend="nccl")
 
         p1 = get_nccl_comm_ptr(pg, device)
-        p2 = get_nccl_comm_ptr(pg, device)  # memoized -> same pointer, no re-resolve
+        p2 = get_nccl_comm_ptr(pg, device)
         clear_comm_ptr_cache()
-        p3 = get_nccl_comm_ptr(pg, device)  # re-resolved after clear
+        p3 = get_nccl_comm_ptr(pg, device)
 
         synthetic = get_group_info(pg, device, require_comm=False).comm_ptr
         p4 = get_nccl_comm_ptr(pg, device)

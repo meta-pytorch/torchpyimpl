@@ -25,8 +25,6 @@ _SYM = re.compile(r"kernel_cutlass__[A-Za-z0-9_]+")
 
 
 def _dummy_handle(world_size: int) -> sm.SymmMemHandle:
-    """A handle with no memory behind it; argument checks run on the host
-    before any launch."""
     return sm.SymmMemHandle(
         buffer_ptr=0,
         signal_pad_ptr=0,
@@ -57,7 +55,6 @@ def test_signal_rejects_channel_past_the_pad() -> None:
     hdl = _dummy_handle(8)
     with pytest.raises(ValueError):
         hdl.put_signal(0, channel=-1)
-    # The pad holds signal_pad_slots() uint32s; channel c needs (c+1)*8 of them.
     with pytest.raises(ValueError):
         hdl.barrier(channel=sm.signal_pad_slots() // 8)
 
@@ -112,8 +109,6 @@ def test_signal_pair_kernels_are_named(put: bool, expected: str) -> None:
 
 
 def _never_signalled_worker(rank: int) -> None:
-    """wait_signal for a signal nobody sends. Runs in its own process because
-    the timeout trap poisons the CUDA context."""
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     pad = torch.zeros(256, dtype=torch.int32, device=device)
@@ -121,13 +116,11 @@ def _never_signalled_worker(rank: int) -> None:
     torch.cuda.synchronize(device)
 
     _signal.wait_signal(pads, 0, 0, world_size=1, channel=0, timeout_ms=1000)
-    torch.cuda.synchronize(device)  # trap surfaces here
+    torch.cuda.synchronize(device)
 
 
 @pytest.mark.gpu
 def test_signal_timeout_faults_instead_of_hanging() -> None:
-    # The kernels are not process-group work, so only the in-kernel deadline can
-    # break the spin. A regression hangs rather than fails, hence the time check.
     start = time.monotonic()
     with pytest.raises(mp.ProcessRaisedException):
         mp.spawn(_never_signalled_worker, nprocs=1, join=True)

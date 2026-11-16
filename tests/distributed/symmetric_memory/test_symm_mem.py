@@ -36,15 +36,12 @@ def _fake_cuda_device(idx: int) -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _unfrozen_signal_pad(monkeypatch: pytest.MonkeyPatch) -> None:
-    # alloc freezes the pad size for the process; start each test unfrozen.
     monkeypatch.setattr(sm, "_signal_pad_size", None)
     monkeypatch.setattr(sm, "_pad_frozen", False)
     monkeypatch.setattr(torch.cuda, "device", _fake_cuda_device)
 
 
 def test_front_region_matches_torch() -> None:
-    # [signal pad | barrier state]: three units of half the pad, each rounded up
-    # to 128 bytes; the state is the last unit.
     pad = sm.signal_pad_bytes()
     unit = sm._round_up((pad + 1) // 2, sm.SIGNAL_PAD_ALIGNMENT)
     assert sm.buffer_offset() == 3 * unit == 13824
@@ -52,8 +49,6 @@ def test_front_region_matches_torch() -> None:
 
 
 def test_signal_pad_env_rejects_nonpositive() -> None:
-    # set_signal_pad_size rejects <= 0, but the env var reaches buffer_offset
-    # without going through it, so the read has to validate too.
     prev = os.environ.get(sm._SIGNAL_PAD_ENV)
     try:
         for bad in ("0", "-128"):
@@ -69,7 +64,7 @@ def test_signal_pad_env_rejects_nonpositive() -> None:
             os.environ[sm._SIGNAL_PAD_ENV] = prev
 
 
-_NBYTES = 4001  # non-16-aligned user size -> round_up(., 16) = 4016
+_NBYTES = 4001
 
 
 class _FaultInjectingAllocator(sm.SymmetricMemoryAllocatorBase):
@@ -243,8 +238,6 @@ def test_alloc_layout_and_find_covering(monkeypatch: pytest.MonkeyPatch) -> None
 
     interior, o = allocator.find_covering(buf + 64)
     assert interior is rec and o == 64
-    # Inside the physical allocation but outside the data buffer: the front
-    # signal pad and the 16-B rounding tail belong to no view.
     assert allocator.find_covering(buf - 8) == (None, 0)
     assert allocator.find_covering(buf + _NBYTES + 8) == (None, 0)
 
@@ -295,7 +288,6 @@ def test_rendezvous_is_cached_per_ptr_and_comm(
     assert h1.buffer_ptr - h1.signal_pad_ptr == sm.buffer_offset()
     assert h1.size == _NBYTES
 
-    # A view at an offset gets its own handle but reuses the peer setup.
     h2 = allocator.rendezvous(buf + 64, 11, 0, 1, device)
     assert h2 is not h1 and h2.offset == 64 and h2.size == _NBYTES - 64
     stats = allocator.cache_stats()

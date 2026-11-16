@@ -29,7 +29,7 @@ import torchpyimpl.distributed.symmetric_memory as symm
 
 
 _SEED = 42
-_SIZES = [1024, 16384, 9973]  # power-of-2, larger, and a prime (masked tail)
+_SIZES = [1024, 16384, 9973]
 
 
 def _free_port() -> int:
@@ -39,7 +39,6 @@ def _free_port() -> int:
 
 
 def _gen_payload(rank: int, n: int, device: torch.device) -> torch.Tensor:
-    """Deterministic per-rank fp32 payload; regenerable on any rank."""
     gen = torch.Generator(device=device).manual_seed(_SEED + rank)
     return torch.empty(n, dtype=torch.float32, device=device).uniform_(
         -1.0, 1.0, generator=gen
@@ -48,8 +47,8 @@ def _gen_payload(rank: int, n: int, device: torch.device) -> torch.Tensor:
 
 @triton.jit
 def _one_shot_all_reduce_kernel(
-    peer_ptrs,  # *i64: world_size entries, each a peer's fp32 buffer base
-    out_ptr,  # *f32
+    peer_ptrs,
+    out_ptr,
     n_elements,
     world_size: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -101,7 +100,6 @@ def _worker(
             torch.cuda.synchronize(device)
             hdl = symm.rendezvous(buf, pg)
 
-            # Every rank must finish its fill before any rank reads peers.
             hdl.barrier()
             out = _one_shot_all_reduce(hdl, n, world_size, device)
             torch.cuda.synchronize(device)
@@ -115,7 +113,6 @@ def _worker(
                 "out_first4": out[:4].tolist(),
                 "exp_first4": expected[:4].tolist(),
             }
-            # Nobody may reuse or free the buffer while a peer is still reading.
             hdl.barrier()
             torch.cuda.synchronize(device)
 
@@ -154,8 +151,6 @@ def test_triton_oneshot_allreduce_numerical(
     for r in reports:
         rank = r["rank"]
         for n, res in r["per_size"].items():
-            # The kernel sums in rank order and so does the reference, so fp32
-            # must agree bit-exactly.
             assert res["max_abs_err"] == 0.0, (
                 f"rank {rank}, size {n}: all-reduce diverges by "
                 f"{res['max_abs_err']} (out={res['out_first4']}, "

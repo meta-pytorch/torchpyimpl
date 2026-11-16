@@ -27,7 +27,6 @@ import torchpyimpl.distributed.symmetric_memory as api
 from torchpyimpl.distributed.symmetric_memory._symm_mem import _cache_stats
 
 
-# Index-pattern base; values stay < 2**24 so fp32 holds them exactly.
 _BASE = 100_000
 
 
@@ -69,8 +68,6 @@ def _init(rank: int, world_size: int, master_port: int, backend: str) -> torch.d
     return device
 
 
-# === group A: kernel behaviors against a single allocation ===================
-
 _N = 1024
 _OFF = 128
 _M = 64
@@ -83,7 +80,6 @@ def _worker_kernel_behaviors(
     try:
         pg = dist.new_group(ranks=list(range(world_size)))
 
-        # Allocation 1: index pattern buf[i] = (rank+1)*BASE + i.
         t1 = api.empty(_N, dtype=torch.float32, device=device)
         idx = torch.arange(_N, dtype=torch.float32, device=device)
         t1.copy_((rank + 1) * _BASE + idx)
@@ -91,8 +87,6 @@ def _worker_kernel_behaviors(
         torch.cuda.synchronize(device)
         dist.barrier(group=pg)
 
-        # (interior offset) Each peer's view at storage_offset=_OFF holds that
-        # peer's pattern: (peer+1)*BASE + _OFF + k.
         k = torch.arange(_M, dtype=torch.float32, device=device)
         interior_ok = all(
             bool(
@@ -104,7 +98,6 @@ def _worker_kernel_behaviors(
             for p in range(world_size)
         )
 
-        # (signal pad peer-accessible) write sentinel into own pad, peers read it.
         own_pad = api.get_signal_pad(h1, rank, (4,), torch.uint32)
         own_pad.fill_(rank + 1)
         torch.cuda.synchronize(device)
@@ -119,7 +112,7 @@ def _worker_kernel_behaviors(
             "signal_pad_peer_ok": signal_pad_peer_ok,
             "has_multicast": api.has_multicast_support(h1),
         }
-        dist.barrier(group=pg)  # peers may still be reading our buffers
+        dist.barrier(group=pg)
         del t1
         report["free_status"] = api.free_pool(device, pg).value
         gathered: list[Any] = [None] * world_size
@@ -146,8 +139,6 @@ def test_kernel_behaviors_per_allocation(backend: str, tmp_path: pathlib.Path) -
         assert r["free_status"] == "freed", f"rank {rank}: {r['free_status']}"
 
 
-# === group B: lifecycle and multiple resources ==============================
-
 _NUM_ALLOCS = 3
 _LN = 512
 
@@ -160,13 +151,11 @@ def _worker_lifecycle(
         pg = dist.new_group(ranks=list(range(world_size)))
 
         def _peers_ok(hdl: Any) -> bool:
-            # Each peer's buffer holds peer+1, so a swapped mapping fails.
             return all(
                 bool(torch.all(api.get_buffer(hdl, p, (_LN,), torch.float32) == p + 1))
                 for p in range(world_size)
             )
 
-        # Several allocations in flight on one comm.
         tensors = [
             api.empty(_LN, dtype=torch.float32, device=device)
             for _ in range(_NUM_ALLOCS)
@@ -179,8 +168,7 @@ def _worker_lifecycle(
         infos_in_flight = _cache_stats()["peer_alloc_infos"]
         peers_ok = all(_peers_ok(h) for h in handles)
 
-        # Realloc-after-free: tear the pool down, then allocate + rendezvous anew.
-        dist.barrier(group=pg)  # peers may still be reading our buffers
+        dist.barrier(group=pg)
         del tensors, t
         free_status = api.free_pool(device, pg).value
         stats_after_free = _cache_stats()

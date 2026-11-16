@@ -101,49 +101,24 @@ import torch.multiprocessing as mp
 import torchpyimpl.distributed.symmetric_memory as symm
 
 
-# ── Knobs ─────────────────────────────────────────────────────────────────────
-# Buffer sizes are swept as powers of two (``--min-log2`` .. ``--max-log2``); the
-# default spans 4 KiB .. 1 GiB, a wide range for a roofline. Ceiling: each rank's
-# *physical* footprint is ~one buffer — the peer P2P mappings and the multicast
-# object are virtual-address only (windows into peers' HBM), so VA is
-# ``(world_size + 1) * N`` but physical is just ``N`` per rank. So N can approach
-# free HBM per GPU (~183 GiB on GB200, i.e. up to ~2^37); in practice the alloc /
-# cold sweeps get slow well before that, so raise ``--max-log2`` deliberately.
-# Raw per-rank results land here. The printed table only shows rank 0's
-# quantiles; the JSON carries every rank, so a straggler stays visible.
-# Results accumulate; nothing here is ever overwritten or removed.
-# TORCHPYIMPL_BENCH_DIR groups one session's runs (compare.sh sets it).
 _RESULT_DIR: str = os.environ.get(
     "TORCHPYIMPL_BENCH_DIR", os.path.join(tempfile.gettempdir(), "torchpyimpl-bench")
 )
 
-# Which implementation a run times. Keeping them in separate processes is the
-# point of BOTH vs OURS/TORCH: torch's NCCLSymmetricMemory registers windows on
-# the same borrowed communicator torchpyimpl uses, and measured side by side the
-# two contend — torchpyimpl's NCCL cold rendezvous inflates ~1.5x and its alloc
-# ~6x. The CUDA backends share no such state and are unaffected.
 OURS: str = "ours"
 TORCH: str = "torch"
 BOTH: str = "both"
 
-_DEFAULT_MIN_LOG2 = 12  # 4 KiB
-_DEFAULT_MAX_LOG2 = 30  # 1 GiB
+_DEFAULT_MIN_LOG2 = 12
+_DEFAULT_MAX_LOG2 = 30
 
-# Cold rendezvous and alloc fire a real cuMem/collective op per iter (ncclMemAlloc
-# / ncclCommWindowRegister). These are expensive AND stress NCCL's symmetric
-# allocator, so keep the counts modest — a handful of samples already gives a
-# stable p50 for ops in the tens-of-us-to-ms range.
 ALLOC_N_WARMUP = 3
 ALLOC_N_REPEAT = 10
 COLD_N_WARMUP = 3
 COLD_N_REPEAT = 10
 
-# Cached rendezvous is host-only for both backends; auto-size to a time budget.
 CACHED_WARMUP_MS = 25
 CACHED_REP_MS = 100
-
-
-# ── Timing helpers ────────────────────────────────────────────────────────────
 
 
 def _free_port() -> int:
@@ -153,7 +128,6 @@ def _free_port() -> int:
 
 
 def _quantiles(times_ms: list[float], qs=(0.2, 0.5, 0.8)) -> tuple[float, ...]:
-    """Linear-interpolated quantiles over a sample list."""
     sorted_t = sorted(times_ms)
     n = len(sorted_t)
 
@@ -173,11 +147,6 @@ def _do_bench_walltime(
     rep_ms: int = CACHED_REP_MS,
     host_only: bool = False,
 ) -> tuple[float, float, float]:
-    """Auto-sized wall-clock bench for host-bound work. Returns p20/p50/p80 ms.
-
-    Uses ``time.perf_counter_ns`` (CUDA events cannot time pure Python/pybind
-    work). ``host_only=True`` skips the per-iter ``cuda.synchronize`` calls (each
-    is ~1 us, which would distort a ~10 us cached-rendezvous reading)."""
     for _ in range(2):
         fn()
 
@@ -216,18 +185,10 @@ def _do_bench_fixed_iters(
     n_repeat: int,
     pre_iter_barrier: dist.ProcessGroup | None = None,
 ) -> tuple[float, float, float]:
-    """Fixed-iteration wall-clock bench for slow/collective ops. Returns
-    p20/p50/p80 ms. ``pre_iter_barrier`` issues ``dist.barrier`` before each iter
-    (warmup and timed) so a collective's measurement is not polluted by the
-    previous iter's max-rank teardown tail — and, for the alloc scenario, so
-    ``ncclMemAlloc``/``ncclMemFree`` on the live comm run in lockstep across ranks
-    (unsynchronized alloc/free corrupts NCCL's symmetric allocator)."""
     for _ in range(n_warmup):
         if pre_iter_barrier is not None:
             dist.barrier(group=pre_iter_barrier)
         fn()
-        # Keep warmup iters from piling up async window ops that race across
-        # ranks (the timed loop already synchronizes after each fn()).
         torch.cuda.synchronize(device)
     torch.cuda.synchronize(device)
 
@@ -244,23 +205,7 @@ def _do_bench_fixed_iters(
     return _quantiles(times_ms)
 
 
-# ── Scenarios ─────────────────────────────────────────────────────────────────
-#
-# Each backend allocates from its own symm-mem MemPool — a rendezvous requires
-# the tensor to come from its own pool, so the two cannot share an allocation.
-# The cold-rendezvous rows therefore include one alloc per iter for both;
-# subtract the alloc-only row to isolate the rendezvous-wrapper delta.
-
-
 def _bench_alloc_torch(nbytes: int, group, device: torch.device):
-    """torch symm-mem allocation, freed outside the timed region.
-
-    Only the allocate is timed. Freeing inside the loop would mean timing
-    ``empty_cache``, which sweeps every cached segment on the device rather than
-    releasing just this one — measured at ~75 ms of an 82 ms loop, i.e. the
-    column would report cache teardown rather than allocation. torchpyimpl's free is
-    targeted and has no equivalent cost, so timing the free makes the two columns
-    incomparable."""
     keep: list = []
 
     def one() -> None:
@@ -271,8 +216,6 @@ def _bench_alloc_torch(nbytes: int, group, device: torch.device):
             one, device, ALLOC_N_WARMUP, ALLOC_N_REPEAT, pre_iter_barrier=group
         )
     finally:
-        # Every rank must finish allocating before any rank frees, or NCCL's
-        # symmetric allocator faults.
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         keep.clear()
@@ -280,15 +223,6 @@ def _bench_alloc_torch(nbytes: int, group, device: torch.device):
 
 
 def _bench_alloc_ours(nbytes: int, group, device: torch.device):
-    """torchpyimpl allocation through the symmetric ``MemPool``, i.e. the custom
-    pluggable allocator — the same shape as torch, whose ``empty`` also allocates
-    from an implicit ``MemPool`` (``TORCH_SYMMMEM_IMPLICIT_POOL``, on by default).
-    Using the standalone allocator here instead would put a caching allocator in
-    front of one side only.
-
-    Every tensor is held for the duration, so no block can be recycled and each
-    iteration is a pool miss — a real ``ncclMemAlloc`` / ``cuMemCreate``. Teardown
-    is deferred out of the timed region (see :func:`_bench_alloc_torch`)."""
     keep: list = []
 
     def one() -> None:
@@ -299,8 +233,6 @@ def _bench_alloc_ours(nbytes: int, group, device: torch.device):
             one, device, ALLOC_N_WARMUP, ALLOC_N_REPEAT, pre_iter_barrier=group
         )
     finally:
-        # Every rank must finish allocating before any rank frees, or NCCL's
-        # symmetric allocator faults.
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         keep.clear()
@@ -309,14 +241,6 @@ def _bench_alloc_ours(nbytes: int, group, device: torch.device):
 
 
 def _bench_rendezvous_cold_torch(nbytes: int, group, device: torch.device):
-    """torch cold rendezvous: fresh ``empty`` + ``rendezvous`` per iteration, so
-    the cache misses and the full collective fires every time.
-
-    Teardown is deferred out of the timed region for the same reason as
-    :func:`_bench_alloc_torch`: the free is ``empty_cache``, a device-wide sweep
-    costing ~75 ms, which is not a rendezvous cost and has no torchpyimpl
-    counterpart. Timing it made torch's cold column ~1.6x torchpyimpl's when the
-    two rendezvous paths are in fact within a few percent."""
     group_name = group.group_name
     keep: list = []
 
@@ -338,10 +262,6 @@ def _bench_rendezvous_cold_torch(nbytes: int, group, device: torch.device):
 
 
 def _bench_rendezvous_cold_ours(nbytes: int, group, device: torch.device):
-    """torchpyimpl cold rendezvous through the public API — ``torchpyimpl.empty`` (the
-    pluggable allocator behind a ``MemPool``) plus ``torchpyimpl.rendezvous``, so the
-    call shape matches torch's ``empty`` + ``rendezvous``. Cache misses every
-    iteration, so the cross-rank step fires each time. Teardown deferred."""
     keep: list = []
 
     def one() -> None:
@@ -364,11 +284,9 @@ def _bench_rendezvous_cold_ours(nbytes: int, group, device: torch.device):
 
 
 def _bench_cached_torch(nbytes: int, group, device: torch.device):
-    """torch C++ cache-hit rendezvous (host-side map lookup). Primes once, times
-    the second-onward call."""
     group_name = group.group_name
     buf = torch_symm_mem.empty(nbytes, dtype=torch.uint8, device=device)
-    _ = torch_symm_mem.rendezvous(buf, group=group_name)  # prime
+    _ = torch_symm_mem.rendezvous(buf, group=group_name)
 
     def one() -> None:
         torch_symm_mem.rendezvous(buf, group=group_name)
@@ -380,11 +298,8 @@ def _bench_cached_torch(nbytes: int, group, device: torch.device):
 
 
 def _bench_cached_ours(nbytes: int, group, device: torch.device):
-    """torchpyimpl cache-hit rendezvous. The hot path is collective-free — a
-    memoized group lookup and a handle-cache hit — so it auto-sizes per rank like
-    torch's (no barrier needed)."""
     t = symm.empty(nbytes, dtype=torch.uint8, device=device)
-    _ = symm.rendezvous(t, group)  # prime
+    _ = symm.rendezvous(t, group)
 
     def one() -> None:
         symm.rendezvous(t, group)
@@ -394,9 +309,6 @@ def _bench_cached_ours(nbytes: int, group, device: torch.device):
     finally:
         symm.free_pool(device)
         torch.cuda.empty_cache()
-
-
-# ── Sweeps (one row builder per scenario; keeps the worker a short orchestrator)
 
 
 def _row(nbytes: int, ours_q=None, torch_q=None) -> dict:
@@ -457,9 +369,6 @@ def _bench_worker(
     backend: str,
     buffer_sizes: list,
 ) -> None:
-    # The lib logs alloc / window register / free at INFO on every iter, which
-    # floods a sweep of hundreds of alloc+rendezvous cycles. Quiet it for the
-    # benchmark — we only care about the timing table.
     logging.getLogger("torchpyimpl").setLevel(logging.WARNING)
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
@@ -470,23 +379,13 @@ def _bench_worker(
     )
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    # torch's native comparison uses torch's *matching* C++ backend, so torchpyimpl
-    # NCCL is timed against torch NCCLSymmetricMemory and torchpyimpl CUDA against
-    # torch CUDASymmetricMemory (apples-to-apples).
     use_torch = measure in (TORCH, BOTH)
     torch_native_note = None
     if use_torch:
-        # torch's symm-mem defaults to the CUDA backend (CUDASymmetricMemory), and
-        # set_backend takes only explicit overrides — set_backend("CUDA") is
-        # rejected since CUDA is the implicit default, not a named allocator. So
-        # only switch when torch's active backend differs from the one we want;
-        # for CUDA we leave the default in place.
         try:
             if torch_symm_mem.get_backend(device) != backend:
                 torch_symm_mem.set_backend(backend)
         except Exception as e:
-            # A named backend torch's build didn't register (e.g. NCCL on a build
-            # without it) — skip the comparison gracefully rather than crashing.
             use_torch = False
             measure = OURS
             torch_native_note = (
@@ -497,18 +396,11 @@ def _bench_worker(
         backend="nccl", rank=rank, world_size=world_size, device_id=device
     )
     try:
-        # Eager-init the comm so neither backend pays lazy-init cost.
         group = dist.group.WORLD
         if group is None:
             raise RuntimeError("default process group was not initialized")
-        symm.set_backend(backend)  # NCCL windows or CUDA-IPC VMM
+        symm.set_backend(backend)
 
-        # The cached-rendezvous sweep is host-only and robust. The alloc + cold
-        # sweeps churn the symmetric allocator (ncclMemAlloc / window register or
-        # cuMemCreate / multicast bind) on the live comm and are opt-in
-        # (--with-alloc-sweeps): on some torch/NCCL builds that churn triggers a
-        # non-deterministic illegal memory access inside NCCL's symmetric
-        # allocator (torchpyimpl's normal one-shot lifecycle is fine).
         results = {
             "rank": rank,
             "world_size": world_size,
@@ -534,18 +426,13 @@ def _bench_worker(
         dist.destroy_process_group()
 
 
-# ── Output (rank 0) ───────────────────────────────────────────────────────────
-
-
 def _fmt_ms(p20: float, p50: float, p80: float) -> str:
-    """us when sub-ms, ms otherwise."""
     if p50 < 1.0:
         return f"{p50 * 1000:>7.2f} us (p20={p20 * 1000:.2f} p80={p80 * 1000:.2f})"
     return f"{p50:>7.2f} ms (p20={p20:.2f} p80={p80:.2f})"
 
 
 def _fmt_bytes(n: int) -> str:
-    """Human-readable power-of-two size, e.g. 4 KiB / 512 MiB / 1 GiB."""
     for div, unit in ((2**30, "GiB"), (2**20, "MiB"), (2**10, "KiB")):
         if n >= div:
             return f"{n / div:g} {unit}"
@@ -553,9 +440,6 @@ def _fmt_bytes(n: int) -> str:
 
 
 def _gbps(nbytes: int, p50_ms: float) -> str:
-    """Setup throughput = bytes / p50 time. For alloc/cold this is the roofline
-    metric (how fast a buffer of this size is stood up); a plateau marks the
-    bandwidth-bound regime, a rising line the latency-bound one."""
     if p50_ms <= 0:
         return "-"
     return f"{nbytes / (p50_ms * 1e6):.1f} GB/s"
@@ -705,11 +589,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _result_path(backend: str, measure: str, with_alloc: bool, world_size: int) -> str:
-    """Where a run's raw JSON goes.
-
-    Named for what produced it — backend, what was measured, sweeps, timestamp —
-    because a bench session is several runs and an anonymous temp file cannot be
-    matched back to its command afterwards."""
     parts = [
         "torchpyimpl-bench",
         backend,
@@ -730,7 +609,6 @@ def _run_one(
     measure: str,
     with_alloc: bool,
 ) -> tuple[list[dict], str]:
-    """Spawn one isolated benchmark run and return (reports, json path)."""
     path = _result_path(backend, measure, with_alloc, world_size)
     mp.spawn(
         _bench_worker,
