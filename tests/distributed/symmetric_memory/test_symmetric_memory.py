@@ -36,7 +36,7 @@ from torchpyimpl.distributed.symmetric_memory.backends import _cuda_ipc
 
 _N_ELEMS = 1024
 _NUM_TENSORS = 3
-_NBYTES = 4001  # non-16-aligned user size -> round_up(., 16) = 4016
+_NBYTES = 4001
 
 
 def _free_port() -> int:
@@ -75,14 +75,11 @@ def _spawn(fn: Any, world_size: int, out: str, *args: Any) -> list[dict[str, Any
         return json.load(f)["reports"]
 
 
-# ── standalone allocator ──────────────────────────────────────────────────────
-
-
 def _alloc_worker(rank: int, result_path: str, transport: str) -> None:
     os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
-    _ = torch.empty(1, device=device)  # ensure a live primary context
+    _ = torch.empty(1, device=device)
 
     buf = sm.alloc(_NBYTES, device)
     off = sm.buffer_offset()
@@ -130,8 +127,6 @@ def test_alloc_find_covering_free(transport: str, tmp_path: pathlib.Path) -> Non
 def _standalone_rendezvous_worker(
     rank: int, world_size: int, port: int, out: str, transport: str
 ) -> None:
-    # Must be set before the first allocation: cuMemCreate bakes the handle type
-    # into the block.
     os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
     _cuda_ipc.reset_transport()
     device = _init_dist(rank, world_size, port)
@@ -146,7 +141,6 @@ def _standalone_rendezvous_worker(
         h2 = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
         stats = sm._cache_stats()
 
-        # Each rank fills its buffer with rank + 1, then reads every peer's.
         cu_memset_d8(buf, rank + 1, nbytes)
         dist.barrier(group=pg)
         peer_data_ok = True
@@ -211,9 +205,6 @@ def test_standalone_rendezvous_cache_and_free(
         assert r["records_after_free"] == 0, rank
 
 
-# ── MemPool API ───────────────────────────────────────────────────────────────
-
-
 def _worker(
     rank: int,
     world_size: int,
@@ -223,8 +214,6 @@ def _worker(
     transport: str | None,
 ) -> None:
     if transport is not None:
-        # Must be set before the first allocation: cuMemCreate bakes the handle
-        # type into the block.
         os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
         _cuda_ipc.reset_transport()
     device = _init_dist(rank, world_size, port)
@@ -240,8 +229,6 @@ def _worker(
             t.fill_(float(rank + 1))
         torch.cuda.synchronize(device)
 
-        # Rendezvous in reverse order: each call establishes only its own
-        # covering allocation.
         handles = [symm.rendezvous(t, pg) for t in reversed(tensors)]
         handles.reverse()
         hdl = handles[0]
@@ -262,12 +249,8 @@ def _worker(
         mc_flags: list[Any] = [None] * world_size
         dist.all_gather_object(mc_flags, symm.has_multicast_support(hdl), group=pg)
 
-        # Fence: the sum above is only correct while every rank still holds
-        # rank+1, so no rank may start stamping until all have summed.
         dist.barrier(group=pg)
 
-        # Signal-pad barrier: stamp our buffer, barrier, then every peer's stamp
-        # must be visible.
         symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32).fill_(float(rank + 100))
         torch.cuda.synchronize(device)
         hdl.barrier()
@@ -275,16 +258,12 @@ def _worker(
             float(symm.get_buffer(hdl, p, (1,), torch.float32)[0].item())
             for p in range(world_size)
         ]
-        # Second round, with another device current: slots must have been left
-        # reusable, and the kernel must run on the handle's device.
         with torch.cuda.device((rank + 1) % torch.cuda.device_count()):
             hdl.barrier()
         torch.cuda.synchronize(device)
 
-        # put_signal / wait_signal ring on channel 1: after the send lands, the
-        # predecessor's slot reads 1, and wait_signal resets it to 0.
         succ, pred = (rank + 1) % world_size, (rank - 1) % world_size
-        slot = 1 * world_size + pred  # channel * world_size + src
+        slot = 1 * world_size + pred
         hdl.put_signal(succ, channel=1)
         torch.cuda.synchronize(device)
         dist.barrier(group=pg)
@@ -294,8 +273,6 @@ def _worker(
         hdl.wait_signal(pred, channel=1)
         torch.cuda.synchronize(device)
         signal_cleared = int(own_pad[slot].item()) == 0
-        # Without this fence the predecessor can start round 2 and re-raise the
-        # slot before it has been read.
         dist.barrier(group=pg)
         hdl.put_signal(succ, channel=1)
         hdl.wait_signal(pred, channel=1)
@@ -373,7 +350,6 @@ def test_symm_mem_mempool(
         assert r["transport"] == transport, rank
         assert all(n == world_size for n in r["buffer_ptrs_len"]), rank
         assert r["all_ptrs_nonzero"], rank
-        # no_split => one segment per tensor => distinct bases, one peer set each
         assert r["distinct_bases"] == _NUM_TENSORS, rank
         assert r["peer_alloc_infos"] == _NUM_TENSORS, rank
         assert r["peer_alloc_infos_unchanged"], rank
@@ -403,9 +379,6 @@ def _open_fds() -> int:
 
 
 def _fd_leak_worker(rank: int, world_size: int, port: int, out: str) -> None:
-    """Repeat alloc -> rendezvous -> free_pool and watch the fd table. Each
-    rendezvous on the fd transport exports one fd, receives world_size - 1 over
-    SCM_RIGHTS, and opens a Unix socket; any escape grows the count per round."""
     os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = "fd"
     _cuda_ipc.reset_transport()
     device = _init_dist(rank, world_size, port)
@@ -434,8 +407,6 @@ def test_posix_fd_transport_does_not_leak_fds(tmp_path: pathlib.Path) -> None:
     reports = _spawn(_fd_leak_worker, world_size, str(tmp_path / "reports.json"))
     assert len(reports) == world_size
     for r in reports:
-        # The first round warms up lazily-opened driver/NCCL fds; after that a
-        # leaking transport grows every round.
         counts = r["counts"]
         assert counts[-1] <= counts[-2], (
             f"rank {r['rank']}: open fd count grew across rounds ({counts})"
@@ -443,9 +414,6 @@ def test_posix_fd_transport_does_not_leak_fds(tmp_path: pathlib.Path) -> None:
 
 
 def _sliced_accessor_worker(rank: int, world_size: int, port: int, out: str) -> None:
-    """A handle from a slice: ``offset`` is measured from the allocation base
-    but ``size`` is the view's, so bounds checks must not count the offset
-    twice."""
     device = _init_dist(rank, world_size, port)
     try:
         pg = dist.new_group(ranks=list(range(world_size)))
@@ -516,7 +484,6 @@ def _empty_device_worker(rank: int, result_path: str) -> None:
 
 @pytest.mark.multi_gpu
 def test_empty_uses_requested_device(tmp_path: pathlib.Path) -> None:
-    # cuda:0 is current; the tensor must still come from cuda:1's pool.
     result_path = str(tmp_path / "report.json")
     mp.spawn(_empty_device_worker, args=(result_path,), nprocs=1)
     with open(result_path) as f:

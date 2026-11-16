@@ -62,8 +62,6 @@ def test_close_peers_tears_down_multicast_before_peer_mappings(
 def test_init_multicast_skips_without_unanimous_support(
     monkeypatch: pytest.MonkeyPatch, world_size: int, support: list[bool]
 ) -> None:
-    # Skipping is decided from the gathered payload alone, so no collective may
-    # run: a rank that entered one here would wait for peers that skipped.
     monkeypatch.setattr(
         _cuda_ipc, "_all_agree", lambda *_args: pytest.fail("collective ran")
     )

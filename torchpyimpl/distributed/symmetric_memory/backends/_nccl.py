@@ -47,13 +47,10 @@ class _NcclHandle:
 @dataclass
 class _NcclWindow:
     handle: RegisteredWindowHandle
-    group: weakref.ref[dist.ProcessGroup] | None  # None for a single rank
+    group: weakref.ref[dist.ProcessGroup] | None
 
 
 def _group_alive(group: weakref.ref[dist.ProcessGroup] | None) -> bool:
-    """False once the group is destroyed: destroy_process_group frees its
-    communicator, and NCCL frees the communicator's windows with it. An aborted
-    group that was not destroyed still counts as alive."""
     if group is None:
         return True
     pg = group()
@@ -66,10 +63,8 @@ _PeerTables = tuple[list[int], list[int], torch.Tensor, torch.Tensor]
 def _peer_tables(
     handle: RegisteredWindowHandle, world_size: int, off: int, device: torch.device
 ) -> _PeerTables:
-    """Peer signal pads and buffers, as lists and as device tensors."""
     signal_pads: list[int] = []
     for peer_rank in range(world_size):
-        # peer window base == peer signal-pad base (signal-pad-first layout)
         p = handle.get_peer_device_pointer(peer_rank)
         if p is None or p == 0:
             raise RuntimeError(
@@ -87,13 +82,7 @@ def _peer_tables(
 
 
 class NCCLAllocator(SymmetricMemoryAllocatorBase):
-    """nccl4py backend: ``ncclMemAlloc`` + ``ncclCommWindowRegister``."""
-
     def alloc_physical(self, block_size: int, device: int) -> tuple[int, object]:
-        # ncclMemAlloc allocates on the *current* device, but the record is filed
-        # under `device`. Without the guard, an allocation requested for another
-        # device is recorded against the wrong one, which breaks the per-device
-        # teardown grouping and the peer mapping.
         with torch.cuda.device(device):
             base = int(nccl_bindings.mem_alloc(block_size))
         return base, _NcclHandle(base, device)
@@ -103,7 +92,6 @@ class NCCLAllocator(SymmetricMemoryAllocatorBase):
         if h.released:
             return CleanupStatus.CLEANED
         device = h.device
-        # ncclMemFree does not wait for kernels still reading the block.
         if should_skip_cuda_cleanup(device):
             return CleanupStatus.DEFERRED
         try:
@@ -116,7 +104,6 @@ class NCCLAllocator(SymmetricMemoryAllocatorBase):
         return CleanupStatus.CLEANED
 
     def allocation_base(self, ptr: int) -> int:
-        # ncclMemAlloc is VMM-backed, so the driver knows the allocation range.
         return cu_mem_get_address_range(ptr)
 
     def establish_peers(
@@ -127,9 +114,6 @@ class NCCLAllocator(SymmetricMemoryAllocatorBase):
         device: torch.device,
         group: object | None = None,
     ) -> _PeerAllocInfo:
-        # The communicator (``comm_ptr``) resolves the peers; ``group`` is the
-        # process group that owns it, for the vote below and the window's
-        # lifetime.
         dev_idx = (
             device.index if device.index is not None else torch.cuda.current_device()
         )
@@ -152,9 +136,6 @@ class NCCLAllocator(SymmetricMemoryAllocatorBase):
             flags=WindowFlag.CollSymmetric,
         )
         off = buffer_offset()
-        # The first multimem query on a communicator can be collective (it
-        # creates the LSA multimem team), so every rank makes it before any step
-        # that can fail on one rank alone. An error means no multicast.
         try:
             mc = handle.get_lsa_multimem_device_pointer(off)
             mc_base = handle.get_lsa_multimem_device_pointer(0)
@@ -186,8 +167,6 @@ class NCCLAllocator(SymmetricMemoryAllocatorBase):
             ok = all(cast(tuple[bool, bool], v)[0] for v in votes)
             all_multicast = all(cast(tuple[bool, bool], v)[1] for v in votes)
         if not ok:
-            # Deregistration is local to the rank. Every rank closes, so the
-            # ranks keep the same windows.
             self._close_unpublished(handle)
             if local_error is not None:
                 raise local_error
@@ -230,11 +209,8 @@ class NCCLAllocator(SymmetricMemoryAllocatorBase):
         if window is None:
             return CleanupStatus.CLEANED
         if pai.cleanup_failed:
-            # nccl4py marks a window closed before it deregisters, so a retry
-            # after a failed close does nothing and must not report success.
             return CleanupStatus.FAILED
         if not _group_alive(window.group):
-            # Destroying the group freed the window with its communicator.
             pai.window = None
             return CleanupStatus.CLEANED
         if should_skip_cuda_cleanup(pai.device):

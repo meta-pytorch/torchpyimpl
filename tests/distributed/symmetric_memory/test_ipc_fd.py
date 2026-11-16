@@ -35,8 +35,6 @@ def _free_port() -> int:
 
 
 def _read(fd: int) -> str:
-    # Received fds share the sender's open file description, so the file offset
-    # is shared across ranks; pread does not use or move it.
     return os.pread(fd, 64, 0).decode()
 
 
@@ -50,14 +48,11 @@ def _worker(rank: int, world_size: int, port: int, tmp: str, result_path: str) -
             f.write(f"rank{rank}")
         fd = os.open(path, os.O_RDONLY)
 
-        # All ranks contribute: each receives every peer's fd for the same file.
         fds = _ipc_fd.all_gather_fds(fd, pg)
         contents = [_read(f) if f is not None else None for f in fds]
         own_returned = fds[rank] == fd
         _ipc_fd.close_fds([f for i, f in enumerate(fds) if i != rank])
 
-        # Only rank 0 contributes: None relays through the ring, and every rank
-        # reads index 0.
         root = _ipc_fd.all_gather_fds(fd if rank == 0 else None, pg)
         root_content = _read(root[0]) if root[0] is not None else None
         others_none = all(f is None for i, f in enumerate(root) if i not in (0,))
@@ -112,7 +107,6 @@ def _failure_worker(rank: int, world_size: int, port: int, result_path: str) -> 
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     try:
         if rank == 1:
-            # Fail at the last receive, after rank 1 has sent all its datagrams.
             recv_fd = _ipc_fd._recv_fd
             calls = [0]
 

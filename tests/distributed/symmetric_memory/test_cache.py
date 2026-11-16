@@ -62,14 +62,11 @@ def _worker(
         t.fill_(float(rank + 1))
         torch.cuda.synchronize(device)
 
-        # Repeat rendezvous: same handle, no new peer setup.
         h0 = symm.rendezvous(t, pg)
         infos_after_first = _cache_stats()["peer_alloc_infos"]
         cache_identity = symm.rendezvous(t, pg) is h0
         repeat_no_new_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first
 
-        # A slice reuses the covering allocation's peer setup; its offset is the
-        # slice's byte offset and its self base is the allocation's data base.
         slice_off_elems = 128
         t_slice = t[slice_off_elems:]
         h_slice = symm.rendezvous(t_slice, pg)
@@ -77,14 +74,11 @@ def _worker(
         slice_offset_ok = h_slice.offset == slice_off_elems * 4
         slice_same_base = h_slice.buffer_ptrs[rank] == h0.buffer_ptrs[rank]
 
-        # A second group gets its own peer setup and handle.
         pg2 = dist.new_group(ranks=list(range(world_size)))
         h_comm2 = symm.rendezvous(t, pg2)
         comm2_new_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first + 1
         comm2_distinct = h_comm2 is not h0 and h_comm2.comm_ptr != h0.comm_ptr
 
-        # free_pool tears down all peer state and evicts every cached handle,
-        # including the slice and second-group handles.
         handles_before_free = _cache_stats()["handles"]
         signal_pad_ok = h0.buffer_ptr - h0.signal_pad_ptr == buffer_offset()
         del t, t_slice, h0, h_slice, h_comm2

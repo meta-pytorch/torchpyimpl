@@ -24,15 +24,11 @@ import torch.distributed as dist
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Long enough to cover a slow rank arriving at the exchange, short enough that a
-# genuinely stuck peer fails the job instead of hanging it forever.
 _RECV_TIMEOUT_S: float = 300.0
 _PAYLOAD: bytes = b"fd"
 
 
 def _socket_path() -> str:
-    """A unique path for this rank's socket. ``AF_UNIX`` paths are capped at
-    ~108 bytes, so keep it short: the temp dir plus a pid + random suffix."""
     return os.path.join(
         tempfile.gettempdir(), f"torchpyimpl-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     )
@@ -42,18 +38,6 @@ def all_gather_fds(
     local_fd: int | None,
     pg: dist.ProcessGroup | None,
 ) -> list[int | None]:
-    """Collective over ``pg``. Return every rank's fd, indexed by group rank.
-    ``pg=None`` means a single rank. If one rank fails, every rank raises.
-
-    ``local_fd`` may be ``None`` for a rank with nothing to contribute (used to
-    broadcast one rank's multicast handle: only the creator passes an fd, and
-    callers read index ``root``). ``None`` relays through the ring like any other
-    slot.
-
-    The returned fds are **owned by the caller** and must all be closed once
-    imported (see :func:`close_fds`); ``local_fd`` is not closed here and is
-    returned at index ``rank``.
-    """
     if pg is None:
         return [local_fd]
     rank = dist.get_rank(pg)
@@ -61,12 +45,6 @@ def all_gather_fds(
     if world_size == 1:
         return [local_fd]
 
-    # Set up before the collective below, so every peer is already listening by
-    # the time anyone learns its address — no connect/send retry needed. This is
-    # also a per-rank failure point (EMFILE, an unwritable temp dir, an AF_UNIX
-    # path over the ~108-byte limit) sitting in front of this function's own
-    # collective, so a rank that fails it still joins that collective with an
-    # empty path rather than walking out and leaving its peers inside.
     path = _socket_path()
     sock: socket.socket | None = None
     setup_error: Exception | None = None
@@ -113,9 +91,6 @@ def all_gather_fds(
             raise RuntimeError(f"rank(s) {failed} failed the fd exchange")
         return fds
     except BaseException as e:
-        # BaseException, not Exception: the callers guard their own export the
-        # same way, so a KeyboardInterrupt or cancellation mid-ring must not
-        # leak the fds we have already received either.
         for i, fd in enumerate(fds):
             if fd is not None and i != rank:
                 os.close(fd)
@@ -123,9 +98,6 @@ def all_gather_fds(
     finally:
         if sock is not None:
             sock.close()
-        # Only unlink what this call created: a failed bind means the path is
-        # somebody else's. Best-effort otherwise — the path is gone once every
-        # peer has sent to us, but a crashed peer could leave it behind.
         if bound:
             try:
                 os.unlink(path)
@@ -134,14 +106,6 @@ def all_gather_fds(
 
 
 def _send_fd(sock: socket.socket, dst_path: str, fd: int | None) -> None:
-    """Send ``fd`` to ``dst_path``. A ``None`` sends the payload with no control
-    message, which the receiver reads back as ``None``.
-
-    Uses ``sendmsg`` directly rather than ``socket.send_fds``: the stdlib helper
-    accepts an ``address`` argument but drops it on the floor, which on an
-    unconnected datagram socket fails with ``ENOTCONN``. Connecting the socket
-    instead is not an option — it would also filter out the datagrams we need to
-    receive from the *other* neighbour in the ring."""
     ancdata = (
         []
         if fd is None
@@ -151,15 +115,8 @@ def _send_fd(sock: socket.socket, dst_path: str, fd: int | None) -> None:
 
 
 def _recv_fd(sock: socket.socket) -> int | None:
-    """Receive one fd, or ``None`` if the sender deliberately passed nothing.
-
-    ``MSG_CTRUNC`` means the kernel dropped the control message — the fd is gone
-    and the slot would otherwise be indistinguishable from a deliberate
-    ``None``, surfacing much later as an opaque driver error on import."""
     _msg, fds, flags, _addr = socket.recv_fds(sock, len(_PAYLOAD), 1)
     if flags & socket.MSG_CTRUNC:
-        # Truncation drops *some* control data, so a descriptor may still have
-        # arrived alongside the flag. Close it before raising.
         for fd in fds:
             os.close(fd)
         raise RuntimeError(
@@ -170,12 +127,6 @@ def _recv_fd(sock: socket.socket) -> int | None:
 
 
 def close_fds(fds: list[int | None]) -> None:
-    """Close every fd in ``fds``, including this rank's own export.
-
-    Both sides of the exchange are transport artifacts: the driver dups an fd
-    on import, and the exporter's block stays alive through the
-    ``CUmemGenericAllocationHandle`` from ``cuMemCreate``, not through the fd.
-    Leaking these would exhaust the fd table one rendezvous at a time."""
     for fd in fds:
         if fd is None:
             continue

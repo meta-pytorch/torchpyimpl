@@ -41,7 +41,7 @@ class _FakeWindow:
 
 
 class _Group:
-    """Stands in for a ProcessGroup that is not in c10d's registry."""
+    pass
 
 
 def _record() -> sm.AllocRecord:
@@ -91,7 +91,7 @@ def test_failed_window_close_stays_failed_on_retry(
     monkeypatch.setattr(_nccl, "should_skip_cuda_cleanup", lambda _device: False)
 
     assert allocator.close_peers(pai) is sm.CleanupStatus.FAILED
-    pai.cleanup_failed = True  # as _close_record_peers records it
+    pai.cleanup_failed = True
     assert allocator.close_peers(pai) is sm.CleanupStatus.FAILED
     assert window.close_calls == 1
     assert pai.window is not None
@@ -126,7 +126,6 @@ def test_single_rank_rendezvous_oom_closes_unpublished_window(
 def test_multirank_rendezvous_oom_closes_window_on_every_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # This rank fails; the peer's vote is ok, and both ranks close.
     window = _FakeWindow()
     allocator = _nccl.NCCLAllocator()
     _patch_window(monkeypatch, window, (True, False))

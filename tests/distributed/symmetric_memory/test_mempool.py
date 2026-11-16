@@ -52,7 +52,7 @@ class _FakeBackend:
         self.skip_cleanup = skip_cleanup
         self.peer_error = peer_error
         self.unreleased = unreleased
-        self.stuck = stuck  # release_pending leaves the queue full
+        self.stuck = stuck
 
     def alloc(self, size: int, device: int, stream: int) -> int:
         raise AssertionError("not expected")
@@ -89,11 +89,6 @@ class _FakeBackend:
 
 
 class _CuMemBackend:
-    """Implement ``PoolBackend`` with ``cuMemAlloc``.
-
-    ``free`` adds a segment to a queue. ``release_pending`` frees the segment.
-    """
-
     def __init__(self) -> None:
         self.live: dict[int, int] = {}
         self.pending: list[int] = []
@@ -218,7 +213,6 @@ def test_free_pool_does_not_mask_empty_cache_failure(
 ) -> None:
     device = torch.device("cuda:125")
     backend = _FakeBackend()
-    # _pools must hold the only reference, or free_pool reports IN_USE.
     monkeypatch.setitem(_mempool._pools, 125, _FakePool())
     monkeypatch.setattr(_allocator, "_backend_resolver", lambda: backend)
     monkeypatch.setattr(torch.cuda, "device", lambda _idx: nullcontext())
@@ -291,7 +285,7 @@ def test_free_pool_keeps_pool_after_incomplete_peer_cleanup(
 def test_free_pool_refuses_pool_with_outside_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pool = _FakePool()  # This local name is the outside reference.
+    pool = _FakePool()
     backend = _FakeBackend()
     monkeypatch.setitem(_mempool._pools, 120, pool)
     monkeypatch.setattr(_allocator, "_backend_resolver", lambda: backend)
@@ -318,7 +312,6 @@ def test_free_pool_refuses_pool_with_live_tensors(
 
 
 def _two_rank_group(monkeypatch: pytest.MonkeyPatch, peer: list[str | None]) -> Any:
-    """A two-rank group whose other rank reports ``peer[i]`` in vote ``i``."""
     votes = iter(peer)
 
     def all_gather_object(out: list[object], obj: object, group: object) -> None:
@@ -364,7 +357,7 @@ def test_free_pool_with_group_reports_a_peer_incomplete_teardown(
 def _mempool_worker(rank: int, result_path: str) -> None:
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
-    _ = torch.empty(1, device=device)  # ensure a live primary context
+    _ = torch.empty(1, device=device)
     backend = _CuMemBackend()
     _allocator.set_backend_resolver(lambda: backend)
 
@@ -416,7 +409,7 @@ def test_mem_pool_routes_to_backend_and_frees() -> None:
 def _in_use_worker(rank: int, result_path: str) -> None:
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
-    _ = torch.empty(1, device=device)  # ensure a live primary context
+    _ = torch.empty(1, device=device)
     backend = _CuMemBackend()
     _allocator.set_backend_resolver(lambda: backend)
 
@@ -457,11 +450,10 @@ def test_free_pool_keeps_pool_while_tensors_are_alive() -> None:
 
 def _other_device_worker(rank: int, result_path: str) -> None:
     torch.cuda.set_device(0)
-    _ = torch.empty(1, device="cuda:0")  # ensure a live primary context
+    _ = torch.empty(1, device="cuda:0")
     backend = _CuMemBackend()
     _allocator.set_backend_resolver(lambda: backend)
 
-    # Request the pool for cuda:1 while cuda:0 is the current device.
     device = torch.device("cuda:1")
     with torch.cuda.use_mem_pool(_mempool.get_mem_pool(device), device=device):
         t = torch.empty(_N_ELEMS, dtype=torch.float32, device=device)
@@ -493,7 +485,7 @@ def test_get_mem_pool_uses_requested_device() -> None:
 def _concurrent_get_mem_pool(rank: int, result_path: str) -> None:
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
-    _ = torch.empty(1, device=device)  # ensure a live primary context
+    _ = torch.empty(1, device=device)
     backend = _CuMemBackend()
     _allocator.set_backend_resolver(lambda: backend)
 
@@ -514,7 +506,7 @@ def _concurrent_get_mem_pool(rank: int, result_path: str) -> None:
         "n": len(pools),
         "distinct_pools": len({id(p) for p in pools}),
     }
-    pools.clear()  # Remove local references before free_pool reclaims the pool.
+    pools.clear()
     _mempool.free_pool(device)
     with open(result_path, "w") as f:
         json.dump(report, f)
@@ -522,8 +514,6 @@ def _concurrent_get_mem_pool(rank: int, result_path: str) -> None:
 
 @pytest.mark.gpu
 def test_get_mem_pool_builds_pool_once_under_concurrency() -> None:
-    # get_mem_pool serializes pool creation. Concurrent callers must receive
-    # the same pool.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
         result_path = tmp.name
     mp.spawn(_concurrent_get_mem_pool, args=(result_path,), nprocs=1, join=True)

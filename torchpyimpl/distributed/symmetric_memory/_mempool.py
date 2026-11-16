@@ -27,7 +27,7 @@ from torchpyimpl.distributed.symmetric_memory._allocator import (
 logger: logging.Logger = logging.getLogger(__name__)
 
 _lock: threading.Lock = threading.Lock()
-_pools: dict[int, torch.cuda.MemPool] = {}  # Store pools by CUDA device index.
+_pools: dict[int, torch.cuda.MemPool] = {}
 
 
 def _device_index(device: torch.device) -> int:
@@ -35,14 +35,6 @@ def _device_index(device: torch.device) -> int:
 
 
 def get_mem_pool(device: torch.device) -> torch.cuda.MemPool:
-    """Return the symmetric memory pool for ``device``.
-
-    The function creates the pool when it is first used. ``use_on_oom=False``
-    prevents other allocations from using pool memory. This setting keeps the
-    allocation state equal on all ranks. ``no_split=True`` gives each segment
-    one allocation and one signal pad. It also keeps the tensor data pointer
-    equal to the allocation data pointer.
-    """
     idx = _device_index(device)
     with _lock:
         if idx not in _pools:
@@ -97,9 +89,9 @@ def _release_pending(allocator: PoolBackend, device: int) -> int:
 class FreePoolStatus(Enum):
     FREED = "freed"
     NOTHING_TO_FREE = "nothing_to_free"
-    IN_USE = "in_use"  # Tensors or outside references keep the pool alive.
-    CUDA_ERROR = "cuda_error"  # The backend skips cleanup after a CUDA error.
-    INCOMPLETE = "incomplete"  # Cleanup started, and a later call must retry.
+    IN_USE = "in_use"
+    CUDA_ERROR = "cuda_error"
+    INCOMPLETE = "incomplete"
 
 
 def _expected_refcount() -> int:
@@ -138,7 +130,6 @@ def _agree(
     status: FreePoolStatus | None,
     failing: tuple[FreePoolStatus, ...],
 ) -> FreePoolStatus | None:
-    """Return the most severe ``failing`` status of any rank, else ``status``."""
     gathered: list[object] = [None] * dist.get_world_size(group)
     dist.all_gather_object(gathered, None if status is None else status.value, group)
     failed = [
@@ -152,20 +143,6 @@ def _agree(
 def free_pool(
     device: torch.device, group: dist.ProcessGroup | None = None
 ) -> FreePoolStatus:
-    """Release the symmetric ``MemPool`` for ``device``.
-
-    First, release peer resources in allocation order. This order is the same
-    on all ranks. Then, release the pool and its memory. Keep the pool if it is
-    in use, if CUDA fails, or if resource cleanup is incomplete. A later call
-    can retry cleanup. The returned status tells which of these occurred.
-
-    Without ``group``, each rank decides alone. With ``group``, the ranks agree
-    before the teardown: if one rank cannot free, no rank frees. All ranks
-    return the same status if one of them is ``IN_USE``, ``INCOMPLETE``, or
-    ``CUDA_ERROR``. Pass the group that rendezvoused the pool's tensors: NCCL
-    needs the same windows on every rank. After ``INCOMPLETE``, the ranks can
-    hold different NCCL windows; retry before a new rendezvous on that group.
-    """
     idx = _device_index(device)
     blocked = _blocked(idx)
     if group is not None:
@@ -186,7 +163,6 @@ def free_pool(
 
 
 def _blocked(idx: int) -> FreePoolStatus | None:
-    """The status if ``free_pool`` must not tear down on this rank, else None."""
     with _lock:
         pool = _pools.get(idx)
     allocator = get_backend()
@@ -210,9 +186,6 @@ def _blocked(idx: int) -> FreePoolStatus | None:
         )
         return FreePoolStatus.CUDA_ERROR
 
-    # _pools and the local name above must hold the only references. If
-    # another reference exists, deleting the pool does not release its
-    # segments.
     if sys.getrefcount(pool) > _expected_refcount() or _active_bytes(pool):
         logger.warning(
             "leaving symmetric MemPool for cuda:%d intact: tensors or other "
@@ -255,10 +228,6 @@ def _teardown(idx: int) -> FreePoolStatus:
             return FreePoolStatus.INCOMPLETE
         del _pools[idx]
     del pool
-    # empty_cache releases segments only on the current device. Deleting the
-    # pool calls the allocator free callback for all remaining segments. The
-    # callback adds each segment to a retryable queue. Drain the queue after all
-    # peer resources are released in the same order on all ranks.
     _empty_cache(idx)
     released = _release_pending(allocator, idx)
     logger.info(

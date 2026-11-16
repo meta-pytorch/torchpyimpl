@@ -28,7 +28,6 @@ from cutlass import Int32, Int64
 from cutlass._mlir.dialects import llvm
 
 
-# cute.AddressSpace is the same object across CuTeDSL versions
 AddressSpace = cute.AddressSpace
 
 _WARP: int = 32
@@ -43,7 +42,7 @@ def _spin_cas(
     deadline_ns: Int64,
     bounded: cutlass.Constexpr[bool],
 ) -> None:
-    result = Int32(swap)  # != expect, so the loop always runs at least once
+    result = Int32(swap)
     while result != Int32(expect):
         result = cute.arch.atomic_cas(
             ptr=addr.llvm_ptr,
@@ -179,7 +178,6 @@ def _launch_barrier(
 
 
 def _threads(world_size: int) -> int:
-    """One thread per peer, rounded up to whole warps (>= 1 warp)."""
     return max(_WARP, -(-world_size // _WARP) * _WARP)
 
 
@@ -235,7 +233,6 @@ def put_signal(
     channel: int,
     timeout_ms: int = 0,
 ) -> None:
-    """Signal ``dst_rank`` from ``rank`` on ``channel`` (one thread)."""
     _compiled_pair(world_size, channel, _WARP, True, timeout_ms > 0, _device())(
         Int64(signal_pad_ptrs.data_ptr()),
         Int32(rank),
