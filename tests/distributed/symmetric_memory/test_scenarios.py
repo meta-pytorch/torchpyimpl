@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 from contextlib import closing
 from typing import Any, TYPE_CHECKING
@@ -20,6 +19,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 
 import torchpyimpl.distributed.symmetric_memory as api
 from torchpyimpl.distributed.symmetric_memory._symm_mem import _cache_stats
@@ -49,78 +49,60 @@ def _spawn(
         return json.load(f)["reports"]
 
 
-def _init(rank: int, world_size: int, master_port: int, backend: str) -> torch.device:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(master_port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    api.set_backend(backend)
-    return device
-
-
 _N = 1024
 _OFF = 128
 _M = 64
 
 
+@dist_worker
 def _worker_kernel_behaviors(
-    rank: int, world_size: int, master_port: int, result_path: str, backend: str
+    rank: int, world_size: int, result_path: str, backend: str
 ) -> None:
-    device = _init(rank, world_size, master_port, backend)
-    try:
-        pg = dist.new_group(ranks=list(range(world_size)))
+    device = torch.device(f"cuda:{rank}")
+    api.set_backend(backend)
+    pg = dist.new_group(ranks=list(range(world_size)))
 
-        t1 = api.empty(_N, dtype=torch.float32, device=device)
-        idx = torch.arange(_N, dtype=torch.float32, device=device)
-        t1.copy_((rank + 1) * _BASE + idx)
-        h1 = api.rendezvous(t1, pg)
-        torch.cuda.synchronize(device)
-        dist.barrier(group=pg)
+    t1 = api.empty(_N, dtype=torch.float32, device=device)
+    idx = torch.arange(_N, dtype=torch.float32, device=device)
+    t1.copy_((rank + 1) * _BASE + idx)
+    h1 = api.rendezvous(t1, pg)
+    torch.cuda.synchronize(device)
+    dist.barrier(group=pg)
 
-        k = torch.arange(_M, dtype=torch.float32, device=device)
-        interior_ok = all(
-            bool(
-                torch.equal(
-                    api.get_buffer(h1, p, (_M,), torch.float32, storage_offset=_OFF),
-                    (p + 1) * _BASE + _OFF + k,
-                )
+    k = torch.arange(_M, dtype=torch.float32, device=device)
+    interior_ok = all(
+        bool(
+            torch.equal(
+                api.get_buffer(h1, p, (_M,), torch.float32, storage_offset=_OFF),
+                (p + 1) * _BASE + _OFF + k,
             )
-            for p in range(world_size)
         )
+        for p in range(world_size)
+    )
 
-        own_pad = api.get_signal_pad(h1, rank, (4,), torch.uint32)
-        own_pad.fill_(rank + 1)
-        torch.cuda.synchronize(device)
-        dist.barrier(group=pg)
-        peer = (rank + 1) % world_size
-        peer_pad = api.get_signal_pad(h1, peer, (4,), torch.uint32)
-        signal_pad_peer_ok = int(peer_pad[0].item()) == (peer + 1)
+    own_pad = api.get_signal_pad(h1, rank, (4,), torch.uint32)
+    own_pad.fill_(rank + 1)
+    torch.cuda.synchronize(device)
+    dist.barrier(group=pg)
+    peer = (rank + 1) % world_size
+    peer_pad = api.get_signal_pad(h1, peer, (4,), torch.uint32)
+    signal_pad_peer_ok = int(peer_pad[0].item()) == (peer + 1)
 
-        report: dict[str, Any] = {
-            "rank": rank,
-            "interior_ok": interior_ok,
-            "signal_pad_peer_ok": signal_pad_peer_ok,
-            "has_multicast": api.has_multicast_support(h1),
-        }
-        dist.barrier(group=pg)
-        del t1
-        report["free_status"] = api.free_pool(device, pg).value
-        gathered: list[Any] = [None] * world_size
-        dist.all_gather_object(gathered, report, group=pg)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump({"reports": gathered}, f)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    report: dict[str, Any] = {
+        "rank": rank,
+        "interior_ok": interior_ok,
+        "signal_pad_peer_ok": signal_pad_peer_ok,
+        "has_multicast": api.has_multicast_support(h1),
+    }
+    dist.barrier(group=pg)
+    del t1
+    report["free_status"] = api.free_pool(device, pg).value
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered, report, group=pg)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump({"reports": gathered}, f)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu
@@ -141,66 +123,64 @@ _NUM_ALLOCS = 3
 _LN = 512
 
 
+@dist_worker
 def _worker_lifecycle(
-    rank: int, world_size: int, master_port: int, result_path: str, backend: str
+    rank: int, world_size: int, result_path: str, backend: str
 ) -> None:
-    device = _init(rank, world_size, master_port, backend)
-    try:
-        pg = dist.new_group(ranks=list(range(world_size)))
+    device = torch.device(f"cuda:{rank}")
+    api.set_backend(backend)
+    pg = dist.new_group(ranks=list(range(world_size)))
 
-        def _peers_ok(hdl: Any) -> bool:
-            return all(
-                bool(torch.all(api.get_buffer(hdl, p, (_LN,), torch.float32) == p + 1))
-                for p in range(world_size)
-            )
+    def _peers_ok(hdl: Any) -> bool:
+        return all(
+            bool(torch.all(api.get_buffer(hdl, p, (_LN,), torch.float32) == p + 1))
+            for p in range(world_size)
+        )
 
-        tensors = [
-            api.empty(_LN, dtype=torch.float32, device=device)
-            for _ in range(_NUM_ALLOCS)
-        ]
-        for t in tensors:
-            t.fill_(float(rank + 1))
-        torch.cuda.synchronize(device)
-        handles = [api.rendezvous(t, pg) for t in tensors]
-        dist.barrier(group=pg)
-        infos_in_flight = _cache_stats()["peer_alloc_infos"]
-        peers_ok = all(_peers_ok(h) for h in handles)
+    tensors = [
+        api.empty(_LN, dtype=torch.float32, device=device) for _ in range(_NUM_ALLOCS)
+    ]
+    for t in tensors:
+        t.fill_(float(rank + 1))
+    torch.cuda.synchronize(device)
+    handles = [api.rendezvous(t, pg) for t in tensors]
+    dist.barrier(group=pg)
+    infos_in_flight = _cache_stats()["peer_alloc_infos"]
+    peers_ok = all(_peers_ok(h) for h in handles)
 
-        dist.barrier(group=pg)
-        del tensors, t
-        free_status = api.free_pool(device, pg).value
-        stats_after_free = _cache_stats()
+    dist.barrier(group=pg)
+    del tensors, t
+    free_status = api.free_pool(device, pg).value
+    stats_after_free = _cache_stats()
 
-        t_new = api.empty(_LN, dtype=torch.float32, device=device)
-        t_new.fill_(float(rank + 1))
-        torch.cuda.synchronize(device)
-        h_new = api.rendezvous(t_new, pg)
-        dist.barrier(group=pg)
-        realloc_ok = _peers_ok(h_new)
-        infos_after_realloc = _cache_stats()["peer_alloc_infos"]
+    t_new = api.empty(_LN, dtype=torch.float32, device=device)
+    t_new.fill_(float(rank + 1))
+    torch.cuda.synchronize(device)
+    h_new = api.rendezvous(t_new, pg)
+    dist.barrier(group=pg)
+    realloc_ok = _peers_ok(h_new)
+    infos_after_realloc = _cache_stats()["peer_alloc_infos"]
 
-        report: dict[str, Any] = {
-            "rank": rank,
-            "infos_in_flight": infos_in_flight,
-            "peers_ok": peers_ok,
-            "free_status": free_status,
-            "infos_after_free": stats_after_free["peer_alloc_infos"],
-            "records_after_free": stats_after_free["records"],
-            "pending_after_free": stats_after_free["pending"],
-            "realloc_ok": realloc_ok,
-            "infos_after_realloc": infos_after_realloc,
-        }
-        dist.barrier(group=pg)
-        del t_new
-        report["final_free_status"] = api.free_pool(device, pg).value
-        gathered: list[Any] = [None] * world_size
-        dist.all_gather_object(gathered, report, group=pg)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump({"reports": gathered}, f)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    report: dict[str, Any] = {
+        "rank": rank,
+        "infos_in_flight": infos_in_flight,
+        "peers_ok": peers_ok,
+        "free_status": free_status,
+        "infos_after_free": stats_after_free["peer_alloc_infos"],
+        "records_after_free": stats_after_free["records"],
+        "pending_after_free": stats_after_free["pending"],
+        "realloc_ok": realloc_ok,
+        "infos_after_realloc": infos_after_realloc,
+    }
+    dist.barrier(group=pg)
+    del t_new
+    report["final_free_status"] = api.free_pool(device, pg).value
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered, report, group=pg)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump({"reports": gathered}, f)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu

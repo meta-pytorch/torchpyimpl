@@ -12,6 +12,7 @@ import os
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from typing import Any, TYPE_CHECKING
 
@@ -24,6 +25,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 from cuda.bindings import driver, runtime
 
 import torchpyimpl.distributed.symmetric_memory as symm
@@ -41,23 +43,6 @@ def _free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-
-def _init(rank: int, world_size: int, port: int, backend: str) -> torch.device:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    symm.set_backend(backend)
-    return device
 
 
 def _spawn(worker: Any, backend: str, tmp_path: pathlib.Path) -> list[dict[str, Any]]:
@@ -219,15 +204,13 @@ def _handle(group: dist.ProcessGroup) -> symm.SymmMemHandle:
     return symm.rendezvous(symm.empty(_N, device="cuda"), group)
 
 
-def _structure_worker(
-    rank: int, world_size: int, port: int, out: str, backend: str
-) -> None:
-    _init(rank, world_size, port, backend)
+@dist_worker
+def _structure_worker(rank: int, world_size: int, out: str, backend: str) -> None:
+    symm.set_backend(backend)
     world = dist.group.WORLD
     other = dist.new_group(list(range(world_size)))
     hdl_a, hdl_same, hdl_other = _handle(world), _handle(world), _handle(other)
     r: dict[str, Any] = {"rank": rank}
-
     main = torch.cuda.Stream()
     main.wait_stream(torch.cuda.current_stream())
     for op_a, op_b in _OP_PAIRS:
@@ -239,7 +222,6 @@ def _structure_worker(
                     launch()
             torch.cuda.synchronize()
             r[f"graph {op_a}->{op_b} same={same}"] = _captured_order(main, a, b)
-
     for same in (True, False):
         b_hdl = hdl_same if same else hdl_other
         r[f"eager same={same}"] = _gated_order(
@@ -247,7 +229,6 @@ def _structure_worker(
             [lambda b_hdl=b_hdl: b_hdl.barrier()],
             expect_ordered=same,
         )
-
     capture_stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
 
@@ -261,7 +242,6 @@ def _structure_worker(
     r["eager across capture"] = _gated_order(
         barrier, barrier, expect_ordered=True, between=capture_barrier
     )
-
     first = torch.cuda.CUDAGraph()
     with torch.cuda.graph(first, stream=capture_stream):
         hdl_a.barrier()
@@ -270,7 +250,6 @@ def _structure_worker(
     torch.cuda.synchronize()
     r["graph second capture"] = _captured_order(main, barrier, barrier)
     r["eager after captures"] = _gated_order(barrier, barrier, expect_ordered=True)
-
     transient = dist.new_group(list(range(world_size)))
     _handle(transient).barrier()
     torch.cuda.synchronize()
@@ -281,7 +260,6 @@ def _structure_worker(
     gc.collect()
     r["states dropped with group"] = before - len(_stream_order._states)
     _report(r, out)
-    dist.destroy_process_group()
 
 
 @pytest.mark.multi_gpu
@@ -331,8 +309,9 @@ def _peer_value(hdl: symm.SymmMemHandle, peer: int) -> float:
     return value
 
 
-def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) -> None:
-    _init(rank, world_size, port, backend)
+@dist_worker
+def _data_worker(rank: int, world_size: int, out: str, backend: str) -> None:
+    symm.set_backend(backend)
     delay = int(100 * _cycles_per_ms())
     world = dist.group.WORLD
     nxt, prv = (rank + 1) % world_size, (rank - 1) % world_size
@@ -345,7 +324,6 @@ def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) 
     torch.cuda.synchronize()
     r: dict[str, Any] = {"rank": rank}
     stream_a, stream_b = torch.cuda.Stream(), torch.cuda.Stream()
-
     with torch.cuda.stream(stream_a):
         if rank == 0:
             torch.cuda._sleep(delay)
@@ -355,7 +333,6 @@ def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) 
         hdl.barrier()
         t.fill_(rank + 10.0)
     r["barrier two streams"] = _peer_value(hdl, nxt) == nxt + 10.0
-
     with torch.cuda.stream(stream_a):
         if rank == 0:
             torch.cuda._sleep(delay)
@@ -367,7 +344,6 @@ def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) 
         hdl.wait_signal(prv)
         t.fill_(rank + 100.0)
     r["put_wait two streams"] = _peer_value(hdl, prv) == prv + 100.0
-
     sleep_done, b_done = torch.cuda.Event(), torch.cuda.Event()
     with torch.cuda.stream(stream_a):
         hdl.barrier()
@@ -379,46 +355,33 @@ def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) 
     b_done.synchronize()
     r["waits on the pad kernel only"] = not sleep_done.query()
     torch.cuda.synchronize()
-
-    errors: list[str] = []
     start = threading.Barrier(2, timeout=30)
     first_done = torch.cuda.Event()
     first_recorded = threading.Event()
 
     def first_thread() -> None:
-        try:
-            with torch.cuda.stream(stream_a):
-                start.wait()
-                if rank == 0:
-                    torch.cuda._sleep(delay)
-                hdl.barrier()
-                t.fill_(rank + 1.0)
-                first_done.record()
-        except Exception as e:
-            errors.append(repr(e))
-        finally:
-            first_recorded.set()
+        with torch.cuda.stream(stream_a):
+            start.wait()
+            if rank == 0:
+                torch.cuda._sleep(delay)
+            hdl.barrier()
+            t.fill_(rank + 1.0)
+            first_done.record()
+        first_recorded.set()
 
     def second_thread() -> None:
-        try:
-            with torch.cuda.stream(stream_b):
-                start.wait()
-                hdl.barrier()
-                first_recorded.wait(timeout=30)
-                stream_b.wait_event(first_done)
-                t.fill_(rank + 10.0)
-        except Exception as e:
-            errors.append(repr(e))
+        with torch.cuda.stream(stream_b):
+            start.wait()
+            hdl.barrier()
+            first_recorded.wait(timeout=30)
+            stream_b.wait_event(first_done)
+            t.fill_(rank + 10.0)
 
-    threads = [threading.Thread(target=f) for f in (first_thread, second_thread)]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join(timeout=60)
-    r["threads finished"] = not any(th.is_alive() for th in threads)
-    r["thread errors"] = errors
+    pool = ThreadPoolExecutor(max_workers=2)
+    for future in [pool.submit(first_thread), pool.submit(second_thread)]:
+        future.result(timeout=60)
+    pool.shutdown()
     r["two threads"] = _peer_value(hdl, nxt) == nxt + 10.0
-
     replays = 4
     counter = torch.zeros(1, device="cuda")
     main, side = torch.cuda.Stream(), torch.cuda.Stream()
@@ -441,7 +404,6 @@ def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) 
     pad = symm.get_signal_pad(hdl, rank)
     r["pad clean after replays"] = bool((pad == 0).all())
     _report(r, out)
-    dist.destroy_process_group()
 
 
 @pytest.mark.multi_gpu
@@ -450,8 +412,6 @@ def _data_worker(rank: int, world_size: int, port: int, out: str, backend: str) 
 def test_ordering_keeps_rounds_apart(backend: str, tmp_path: pathlib.Path) -> None:
     for r in _spawn(_data_worker, backend, tmp_path):
         rank = r["rank"]
-        assert r["threads finished"], f"rank {rank}: a thread hung"
-        assert not r["thread errors"], f"rank {rank}: {r['thread errors']}"
         for key in (
             "barrier two streams",
             "put_wait two streams",

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 
 from torchpyimpl.distributed.symmetric_memory.backends import _ipc_fd
 
@@ -38,47 +39,43 @@ def _read(fd: int) -> str:
     return os.pread(fd, 64, 0).decode()
 
 
-def _worker(rank: int, world_size: int, port: int, tmp: str, result_path: str) -> None:
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
-    try:
-        pg = dist.group.WORLD
-        path = os.path.join(tmp, f"rank{rank}")
-        with open(path, "w") as f:
-            f.write(f"rank{rank}")
-        fd = os.open(path, os.O_RDONLY)
+@dist_worker(backend="gloo")
+def _worker(rank: int, world_size: int, tmp: str, result_path: str) -> None:
+    pg = dist.group.WORLD
+    path = os.path.join(tmp, f"rank{rank}")
+    with open(path, "w") as f:
+        f.write(f"rank{rank}")
+    fd = os.open(path, os.O_RDONLY)
 
-        fds = _ipc_fd.all_gather_fds(fd, pg)
-        contents = [_read(f) if f is not None else None for f in fds]
-        own_returned = fds[rank] == fd
-        _ipc_fd.close_fds([f for i, f in enumerate(fds) if i != rank])
+    fds = _ipc_fd.all_gather_fds(fd, pg)
+    contents = [_read(f) if f is not None else None for f in fds]
+    own_returned = fds[rank] == fd
+    _ipc_fd.close_fds([f for i, f in enumerate(fds) if i != rank])
 
-        root = _ipc_fd.all_gather_fds(fd if rank == 0 else None, pg)
-        root_content = _read(root[0]) if root[0] is not None else None
-        others_none = all(f is None for i, f in enumerate(root) if i not in (0,))
-        if rank != 0 and root[0] is not None:
-            os.close(root[0])
-        os.close(fd)
+    root = _ipc_fd.all_gather_fds(fd if rank == 0 else None, pg)
+    root_content = _read(root[0]) if root[0] is not None else None
+    others_none = all(f is None for i, f in enumerate(root) if i not in (0,))
+    if rank != 0 and root[0] is not None:
+        os.close(root[0])
+    os.close(fd)
 
-        report: dict[str, Any] = {
-            "rank": rank,
-            "contents": contents,
-            "own_returned": own_returned,
-            "root_content": root_content,
-            "others_none": others_none,
-            "leftover_sockets": [
-                p
-                for p in os.listdir(tempfile.gettempdir())
-                if p.startswith(f"torchpyimpl-{os.getpid()}-")
-            ],
-        }
-        gathered: list[Any] = [None] * world_size
-        dist.all_gather_object(gathered, report)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump(gathered, f)
-    finally:
-        dist.destroy_process_group()
+    report: dict[str, Any] = {
+        "rank": rank,
+        "contents": contents,
+        "own_returned": own_returned,
+        "root_content": root_content,
+        "others_none": others_none,
+        "leftover_sockets": [
+            p
+            for p in os.listdir(tempfile.gettempdir())
+            if p.startswith(f"torchpyimpl-{os.getpid()}-")
+        ],
+    }
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered, report)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump(gathered, f)
 
 
 def test_all_gather_fds(tmp_path: pathlib.Path) -> None:
@@ -102,34 +99,30 @@ def test_all_gather_fds(tmp_path: pathlib.Path) -> None:
         assert not r["leftover_sockets"], f"rank {rank}: {r['leftover_sockets']}"
 
 
-def _failure_worker(rank: int, world_size: int, port: int, result_path: str) -> None:
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+@dist_worker(backend="gloo")
+def _failure_worker(rank: int, world_size: int, result_path: str) -> None:
+    if rank == 1:
+        recv_fd = _ipc_fd._recv_fd
+        calls = [0]
+
+        def recv_then_fail(sock: socket.socket, src_path: str) -> int | None:
+            calls[0] += 1
+            fd = recv_fd(sock, src_path)
+            if calls[0] == world_size - 1:
+                raise RuntimeError("injected receive failure")
+            return fd
+
+        _ipc_fd._recv_fd = recv_then_fail
+    error = ""
     try:
-        if rank == 1:
-            recv_fd = _ipc_fd._recv_fd
-            calls = [0]
-
-            def recv_then_fail(sock: socket.socket, src_path: str) -> int | None:
-                calls[0] += 1
-                fd = recv_fd(sock, src_path)
-                if calls[0] == world_size - 1:
-                    raise RuntimeError("injected receive failure")
-                return fd
-
-            _ipc_fd._recv_fd = recv_then_fail
-        error = ""
-        try:
-            _ipc_fd.all_gather_fds(os.open(os.devnull, os.O_RDONLY), dist.group.WORLD)
-        except RuntimeError as e:
-            error = str(e)
-        errors: list[Any] = [None] * world_size
-        dist.all_gather_object(errors, error)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump(errors, f)
-    finally:
-        dist.destroy_process_group()
+        _ipc_fd.all_gather_fds(os.open(os.devnull, os.O_RDONLY), dist.group.WORLD)
+    except RuntimeError as e:
+        error = str(e)
+    errors: list[Any] = [None] * world_size
+    dist.all_gather_object(errors, error)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump(errors, f)
 
 
 def test_all_gather_fds_raises_on_every_rank_when_one_rank_fails(

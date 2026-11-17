@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 from contextlib import closing
 from typing import Any, TYPE_CHECKING
@@ -22,6 +21,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import triton
 import triton.language as tl
+from _dist_worker import dist_worker
 
 import torchpyimpl.distributed.symmetric_memory as symm
 
@@ -72,59 +72,44 @@ def _one_shot_all_reduce(
     return out
 
 
-def _worker(
-    rank: int, world_size: int, master_port: int, result_path: str, backend: str
-) -> None:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(master_port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
+@dist_worker
+def _worker(rank: int, world_size: int, result_path: str, backend: str) -> None:
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    try:
-        symm.set_backend(backend)
-        pg = dist.new_group(ranks=list(range(world_size)))
+    symm.set_backend(backend)
+    pg = dist.new_group(ranks=list(range(world_size)))
 
-        per_size: dict[str, Any] = {}
-        for n in _SIZES:
-            buf = symm.empty(n, dtype=torch.float32, device=device)
-            buf.copy_(_gen_payload(rank, n, device))
-            torch.cuda.synchronize(device)
-            hdl = symm.rendezvous(buf, pg)
+    per_size: dict[str, Any] = {}
+    for n in _SIZES:
+        buf = symm.empty(n, dtype=torch.float32, device=device)
+        buf.copy_(_gen_payload(rank, n, device))
+        torch.cuda.synchronize(device)
+        hdl = symm.rendezvous(buf, pg)
 
-            hdl.barrier()
-            out = _one_shot_all_reduce(hdl, n, world_size, device)
-            torch.cuda.synchronize(device)
+        hdl.barrier()
+        out = _one_shot_all_reduce(hdl, n, world_size, device)
+        torch.cuda.synchronize(device)
 
-            expected = torch.zeros(n, dtype=torch.float32, device=device)
-            for r in range(world_size):
-                expected += _gen_payload(r, n, device)
+        expected = torch.zeros(n, dtype=torch.float32, device=device)
+        for r in range(world_size):
+            expected += _gen_payload(r, n, device)
 
-            per_size[str(n)] = {
-                "max_abs_err": (out - expected).abs().max().item(),
-                "out_first4": out[:4].tolist(),
-                "exp_first4": expected[:4].tolist(),
-            }
-            hdl.barrier()
-            torch.cuda.synchronize(device)
+        per_size[str(n)] = {
+            "max_abs_err": (out - expected).abs().max().item(),
+            "out_first4": out[:4].tolist(),
+            "exp_first4": expected[:4].tolist(),
+        }
+        hdl.barrier()
+        torch.cuda.synchronize(device)
 
-        symm.free_pool(device)
+    symm.free_pool(device)
 
-        report: dict[str, Any] = {"rank": rank, "per_size": per_size}
-        gathered: list[Any] = [None] * world_size
-        dist.all_gather_object(gathered, report, group=pg)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump({"reports": gathered}, f)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    report: dict[str, Any] = {"rank": rank, "per_size": per_size}
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered, report, group=pg)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump({"reports": gathered}, f)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu

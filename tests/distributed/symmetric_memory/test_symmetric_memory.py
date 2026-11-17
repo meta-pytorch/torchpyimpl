@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 from cuda.bindings import driver
 
 import torchpyimpl.distributed.symmetric_memory as symm
@@ -44,22 +45,6 @@ def _free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-
-def _init_dist(rank: int, world_size: int, port: int) -> torch.device:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    return device
 
 
 def _gather_reports(report: dict[str, Any], pg: dist.ProcessGroup, out: str) -> None:
@@ -125,52 +110,50 @@ def test_alloc_find_covering_free(transport: str, tmp_path: pathlib.Path) -> Non
     assert r["records_after_free"] == 0
 
 
+@dist_worker
 def _standalone_rendezvous_worker(
-    rank: int, world_size: int, port: int, out: str, transport: str
+    rank: int, world_size: int, out: str, transport: str
 ) -> None:
+    device = torch.device(f"cuda:{rank}")
     os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
     _cuda_ipc.reset_transport()
-    device = _init_dist(rank, world_size, port)
-    try:
-        pg = dist.new_group(ranks=list(range(world_size)))
-        comm_ptr = get_group_info(pg, device, require_comm=False).comm_ptr
-        nbytes = _N_ELEMS * 4
-        buf = sm.alloc(nbytes, device)
-        torch.cuda.synchronize(device)
+    pg = dist.new_group(ranks=list(range(world_size)))
+    comm_ptr = get_group_info(pg, device, require_comm=False).comm_ptr
+    nbytes = _N_ELEMS * 4
+    buf = sm.alloc(nbytes, device)
+    torch.cuda.synchronize(device)
 
-        h1 = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
-        h2 = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
-        stats = sm._cache_stats()
+    h1 = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
+    h2 = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
+    stats = sm._cache_stats()
 
-        cu_memset_d8(buf, rank + 1, nbytes)
-        dist.barrier(group=pg)
-        peer_data_ok = True
-        for peer in range(world_size):
-            dst = torch.empty(nbytes, dtype=torch.uint8, device=device)
-            (err,) = driver.cuMemcpy(dst.data_ptr(), h1.buffer_ptrs[peer], nbytes)
-            ok = err == driver.CUresult.CUDA_SUCCESS
-            peer_data_ok = peer_data_ok and ok and bool((dst == peer + 1).all())
-        report: dict[str, Any] = {
-            "rank": rank,
-            "buffer_ptrs_len": len(h1.buffer_ptrs),
-            "all_nonzero": all(p != 0 for p in h1.buffer_ptrs),
-            "self_ptr": h1.buffer_ptrs[rank] == buf,
-            "signal_pad_first": h1.buffer_ptr - h1.signal_pad_ptr == sm.buffer_offset(),
-            "cache_same": h2 is h1,
-            "cached_lookup": sm.get_cached_handle(buf, comm_ptr) is h1,
-            "peer_alloc_infos": stats["peer_alloc_infos"],
-            "transport": _cuda_ipc.get_transport(rank).value,
-            "peer_data_ok": peer_data_ok,
-        }
-        dist.barrier(group=pg)
-        sm.free(buf)
-        after = sm._cache_stats()
-        report["peer_alloc_infos_after_free"] = after["peer_alloc_infos"]
-        report["records_after_free"] = after["records"]
-        _gather_reports(report, pg, out)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    cu_memset_d8(buf, rank + 1, nbytes)
+    dist.barrier(group=pg)
+    peer_data_ok = True
+    for peer in range(world_size):
+        dst = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        (err,) = driver.cuMemcpy(dst.data_ptr(), h1.buffer_ptrs[peer], nbytes)
+        ok = err == driver.CUresult.CUDA_SUCCESS
+        peer_data_ok = peer_data_ok and ok and bool((dst == peer + 1).all())
+    report: dict[str, Any] = {
+        "rank": rank,
+        "buffer_ptrs_len": len(h1.buffer_ptrs),
+        "all_nonzero": all(p != 0 for p in h1.buffer_ptrs),
+        "self_ptr": h1.buffer_ptrs[rank] == buf,
+        "signal_pad_first": h1.buffer_ptr - h1.signal_pad_ptr == sm.buffer_offset(),
+        "cache_same": h2 is h1,
+        "cached_lookup": sm.get_cached_handle(buf, comm_ptr) is h1,
+        "peer_alloc_infos": stats["peer_alloc_infos"],
+        "transport": _cuda_ipc.get_transport(rank).value,
+        "peer_data_ok": peer_data_ok,
+    }
+    dist.barrier(group=pg)
+    sm.free(buf)
+    after = sm._cache_stats()
+    report["peer_alloc_infos_after_free"] = after["peer_alloc_infos"]
+    report["records_after_free"] = after["records"]
+    _gather_reports(report, pg, out)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu
@@ -206,121 +189,116 @@ def test_standalone_rendezvous_cache_and_free(
         assert r["records_after_free"] == 0, rank
 
 
+@dist_worker
 def _worker(
     rank: int,
     world_size: int,
-    port: int,
     out: str,
     backend: str,
     transport: str | None,
 ) -> None:
+    device = torch.device(f"cuda:{rank}")
     if transport is not None:
         os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
         _cuda_ipc.reset_transport()
-    device = _init_dist(rank, world_size, port)
-    try:
-        symm.set_backend(backend)
-        pg = dist.new_group(ranks=list(range(world_size)))
+    symm.set_backend(backend)
+    pg = dist.new_group(ranks=list(range(world_size)))
 
-        tensors = [
-            symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
-            for _ in range(_NUM_TENSORS)
-        ]
-        for t in tensors:
-            t.fill_(float(rank + 1))
-        torch.cuda.synchronize(device)
+    tensors = [
+        symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
+        for _ in range(_NUM_TENSORS)
+    ]
+    for t in tensors:
+        t.fill_(float(rank + 1))
+    torch.cuda.synchronize(device)
 
-        handles = [symm.rendezvous(t, pg) for t in reversed(tensors)]
-        handles.reverse()
-        hdl = handles[0]
+    handles = [symm.rendezvous(t, pg) for t in reversed(tensors)]
+    handles.reverse()
+    hdl = handles[0]
 
-        stats_before = sm._cache_stats()
-        cache_same = symm.rendezvous(tensors[0], pg) is hdl
-        stats_after = sm._cache_stats()
+    stats_before = sm._cache_stats()
+    cache_same = symm.rendezvous(tensors[0], pg) is hdl
+    stats_after = sm._cache_stats()
 
-        dist.barrier(group=pg)
-        acc = torch.zeros(_N_ELEMS, dtype=torch.float32, device=device)
-        for peer in range(world_size):
-            acc += symm.get_buffer(hdl, peer, (_N_ELEMS,), torch.float32)
-        torch.cuda.synchronize(device)
+    dist.barrier(group=pg)
+    acc = torch.zeros(_N_ELEMS, dtype=torch.float32, device=device)
+    for peer in range(world_size):
+        acc += symm.get_buffer(hdl, peer, (_N_ELEMS,), torch.float32)
+    torch.cuda.synchronize(device)
 
-        pad = symm.get_signal_pad(hdl, rank)
-        torch.cuda.synchronize(device)
+    pad = symm.get_signal_pad(hdl, rank)
+    torch.cuda.synchronize(device)
 
-        mc_flags: list[Any] = [None] * world_size
-        dist.all_gather_object(mc_flags, symm.has_multicast_support(hdl), group=pg)
+    mc_flags: list[Any] = [None] * world_size
+    dist.all_gather_object(mc_flags, symm.has_multicast_support(hdl), group=pg)
 
-        dist.barrier(group=pg)
+    dist.barrier(group=pg)
 
-        symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32).fill_(float(rank + 100))
-        torch.cuda.synchronize(device)
+    symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32).fill_(float(rank + 100))
+    torch.cuda.synchronize(device)
+    hdl.barrier()
+    stamps = [
+        float(symm.get_buffer(hdl, p, (1,), torch.float32)[0].item())
+        for p in range(world_size)
+    ]
+    with torch.cuda.device((rank + 1) % torch.cuda.device_count()):
         hdl.barrier()
-        stamps = [
-            float(symm.get_buffer(hdl, p, (1,), torch.float32)[0].item())
-            for p in range(world_size)
-        ]
-        with torch.cuda.device((rank + 1) % torch.cuda.device_count()):
-            hdl.barrier()
-        torch.cuda.synchronize(device)
+    torch.cuda.synchronize(device)
 
-        succ, pred = (rank + 1) % world_size, (rank - 1) % world_size
-        slot = 1 * world_size + pred
-        hdl.put_signal(succ, channel=1)
-        torch.cuda.synchronize(device)
-        dist.barrier(group=pg)
-        own_pad = symm.get_signal_pad(hdl, rank)
-        torch.cuda.synchronize(device)
-        signal_raised = int(own_pad[slot].item()) == 1
-        hdl.wait_signal(pred, channel=1)
-        torch.cuda.synchronize(device)
-        signal_cleared = int(own_pad[slot].item()) == 0
-        dist.barrier(group=pg)
-        hdl.put_signal(succ, channel=1)
-        hdl.wait_signal(pred, channel=1)
-        torch.cuda.synchronize(device)
-        pad_drained = bool(torch.all(symm.get_signal_pad(hdl, rank) == 0).item())
+    succ, pred = (rank + 1) % world_size, (rank - 1) % world_size
+    slot = 1 * world_size + pred
+    hdl.put_signal(succ, channel=1)
+    torch.cuda.synchronize(device)
+    dist.barrier(group=pg)
+    own_pad = symm.get_signal_pad(hdl, rank)
+    torch.cuda.synchronize(device)
+    signal_raised = int(own_pad[slot].item()) == 1
+    hdl.wait_signal(pred, channel=1)
+    torch.cuda.synchronize(device)
+    signal_cleared = int(own_pad[slot].item()) == 0
+    dist.barrier(group=pg)
+    hdl.put_signal(succ, channel=1)
+    hdl.wait_signal(pred, channel=1)
+    torch.cuda.synchronize(device)
+    pad_drained = bool(torch.all(symm.get_signal_pad(hdl, rank) == 0).item())
 
-        report: dict[str, Any] = {
-            "rank": rank,
-            "backend": sm.get_active_backend(),
-            "transport": (
-                _cuda_ipc.get_transport(rank).value if backend == "CUDA" else None
-            ),
-            "buffer_ptrs_len": [len(h.buffer_ptrs) for h in handles],
-            "all_ptrs_nonzero": all(
-                all(p != 0 for p in h.buffer_ptrs) for h in handles
-            ),
-            "distinct_bases": len({h.buffer_ptrs[rank] for h in handles}),
-            "peer_alloc_infos": stats_after["peer_alloc_infos"],
-            "peer_alloc_infos_unchanged": (
-                stats_before["peer_alloc_infos"] == stats_after["peer_alloc_infos"]
-            ),
-            "cache_same": cache_same,
-            "signal_pad_ok": hdl.buffer_ptr - hdl.signal_pad_ptr == sm.buffer_offset(),
-            "pad_zeroed": bool(torch.all(pad == 0).item()),
-            "sum_first": float(acc[0].item()),
-            "sum_all_equal": bool(torch.all(acc == acc[0]).item()),
-            "multicast_agreed": len(set(mc_flags)) == 1,
-            "stamps": stamps,
-            "barrier_ok": stamps == [float(p + 100) for p in range(world_size)],
-            "signal_raised": signal_raised,
-            "signal_cleared": signal_cleared,
-            "pad_drained": pad_drained,
-        }
+    report: dict[str, Any] = {
+        "rank": rank,
+        "backend": sm.get_active_backend(),
+        "transport": (
+            _cuda_ipc.get_transport(rank).value if backend == "CUDA" else None
+        ),
+        "buffer_ptrs_len": [len(h.buffer_ptrs) for h in handles],
+        "all_ptrs_nonzero": all(all(p != 0 for p in h.buffer_ptrs) for h in handles),
+        "distinct_bases": len({h.buffer_ptrs[rank] for h in handles}),
+        "peer_alloc_infos": stats_after["peer_alloc_infos"],
+        "peer_alloc_infos_unchanged": (
+            stats_before["peer_alloc_infos"] == stats_after["peer_alloc_infos"]
+        ),
+        "cache_same": cache_same,
+        "signal_pad_ok": hdl.buffer_ptr - hdl.signal_pad_ptr == sm.buffer_offset(),
+        "pad_zeroed": bool(torch.all(pad == 0).item()),
+        "sum_first": float(acc[0].item()),
+        "sum_all_equal": bool(torch.all(acc == acc[0]).item()),
+        "multicast_agreed": len(set(mc_flags)) == 1,
+        "stamps": stamps,
+        "barrier_ok": stamps == [float(p + 100) for p in range(world_size)],
+        "signal_raised": signal_raised,
+        "signal_cleared": signal_cleared,
+        "pad_drained": pad_drained,
+    }
 
-        dist.barrier(group=pg)
-        del tensors, t
-        report["free_status"] = symm.free_pool(device).value
-        report["peer_alloc_infos_after_free"] = sm._cache_stats()["peer_alloc_infos"]
-        try:
-            symm.get_buffer(hdl, rank, (1,), torch.float32)
-            report["stale_handle_rejected"] = False
-        except RuntimeError:
-            report["stale_handle_rejected"] = True
-        _gather_reports(report, pg, out)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    dist.barrier(group=pg)
+    del tensors, t
+    report["free_status"] = symm.free_pool(device).value
+    report["peer_alloc_infos_after_free"] = sm._cache_stats()["peer_alloc_infos"]
+    try:
+        symm.get_buffer(hdl, rank, (1,), torch.float32)
+        report["stale_handle_rejected"] = False
+    except RuntimeError:
+        report["stale_handle_rejected"] = True
+    _gather_reports(report, pg, out)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu
@@ -379,24 +357,22 @@ def _open_fds() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
-def _fd_leak_worker(rank: int, world_size: int, port: int, out: str) -> None:
+@dist_worker
+def _fd_leak_worker(rank: int, world_size: int, out: str) -> None:
+    device = torch.device(f"cuda:{rank}")
     os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = "fd"
     _cuda_ipc.reset_transport()
-    device = _init_dist(rank, world_size, port)
-    try:
-        pg = dist.new_group(ranks=list(range(world_size)))
-        counts = []
-        for _ in range(4):
-            t = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
-            symm.rendezvous(t, pg)
-            del t
-            symm.free_pool(device)
-            dist.barrier(group=pg)
-            counts.append(_open_fds())
-        _gather_reports({"rank": rank, "counts": counts}, pg, out)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    pg = dist.new_group(ranks=list(range(world_size)))
+    counts = []
+    for _ in range(4):
+        t = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
+        symm.rendezvous(t, pg)
+        del t
+        symm.free_pool(device)
+        dist.barrier(group=pg)
+        counts.append(_open_fds())
+    _gather_reports({"rank": rank, "counts": counts}, pg, out)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu
@@ -414,44 +390,38 @@ def test_posix_fd_transport_does_not_leak_fds(tmp_path: pathlib.Path) -> None:
         )
 
 
-def _sliced_accessor_worker(rank: int, world_size: int, port: int, out: str) -> None:
-    device = _init_dist(rank, world_size, port)
-    try:
-        pg = dist.new_group(ranks=list(range(world_size)))
-        base = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
-        hdl = symm.rendezvous(base[_N_ELEMS // 2 :], pg)
-        r: dict[str, Any] = {"rank": rank, "offset": hdl.offset}
-        fits = hdl.size // 4
+@dist_worker
+def _sliced_accessor_worker(rank: int, world_size: int, out: str) -> None:
+    device = torch.device(f"cuda:{rank}")
+    pg = dist.new_group(ranks=list(range(world_size)))
+    base = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
+    hdl = symm.rendezvous(base[_N_ELEMS // 2 :], pg)
+    r: dict[str, Any] = {"rank": rank, "offset": hdl.offset}
+    fits = hdl.size // 4
 
-        symm.get_remote_tensor(hdl, rank, (fits,), torch.float32)
-        r["fills_to_end_accepted"] = True
-        try:
-            symm.get_remote_tensor(hdl, rank, (fits + 1,), torch.float32)
-            r["past_end_rejected"] = False
-        except ValueError:
-            r["past_end_rejected"] = True
-        try:
-            symm.get_buffer(hdl, -1, (1,), torch.float32)
-            r["negative_peer_rejected"] = False
-        except ValueError:
-            r["negative_peer_rejected"] = True
-        r["device_ok"] = (
-            symm.get_buffer(hdl, rank, (1,), torch.float32).device == device
-        )
-        try:
-            symm.get_buffer(hdl, rank, (1,), torch.float32, storage_offset=-1)
-            r["negative_offset_rejected"] = False
-        except ValueError:
-            r["negative_offset_rejected"] = True
-        r["group_name_ok"] = (
-            symm.rendezvous(base[_N_ELEMS // 2 :], pg.group_name) is hdl
-        )
-        pad = symm.get_signal_pad(hdl, rank, sizes=[], dtype=None)
-        r["pad_defaults_ok"] = pad.numel() * 4 == sm.signal_pad_bytes()
-        _gather_reports(r, pg, out)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    symm.get_remote_tensor(hdl, rank, (fits,), torch.float32)
+    r["fills_to_end_accepted"] = True
+    try:
+        symm.get_remote_tensor(hdl, rank, (fits + 1,), torch.float32)
+        r["past_end_rejected"] = False
+    except ValueError:
+        r["past_end_rejected"] = True
+    try:
+        symm.get_buffer(hdl, -1, (1,), torch.float32)
+        r["negative_peer_rejected"] = False
+    except ValueError:
+        r["negative_peer_rejected"] = True
+    r["device_ok"] = symm.get_buffer(hdl, rank, (1,), torch.float32).device == device
+    try:
+        symm.get_buffer(hdl, rank, (1,), torch.float32, storage_offset=-1)
+        r["negative_offset_rejected"] = False
+    except ValueError:
+        r["negative_offset_rejected"] = True
+    r["group_name_ok"] = symm.rendezvous(base[_N_ELEMS // 2 :], pg.group_name) is hdl
+    pad = symm.get_signal_pad(hdl, rank, sizes=[], dtype=None)
+    r["pad_defaults_ok"] = pad.numel() * 4 == sm.signal_pad_bytes()
+    _gather_reports(r, pg, out)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu
@@ -474,8 +444,9 @@ def test_sliced_handle_accessors(tmp_path: pathlib.Path) -> None:
         assert r["pad_defaults_ok"], f"rank {rank}: wrong default signal pad view"
 
 
-def _group_name_worker(rank: int, world_size: int, port: int, out: str) -> None:
-    device = _init_dist(rank, world_size, port)
+@dist_worker
+def _group_name_worker(rank: int, world_size: int, out: str) -> None:
+    device = torch.device(f"cuda:{rank}")
     pg_a = dist.new_group(ranks=list(range(world_size)))
     pg_b = dist.new_group(
         ranks=list(range(world_size)), timeout=datetime.timedelta(seconds=7)
@@ -504,7 +475,6 @@ def _group_name_worker(rank: int, world_size: int, port: int, out: str) -> None:
     gc.collect()
     r["b_timeout_after_destroy_ms"] = api._resolve_timeout(hdl_b, None)
     _gather_reports(r, dist.group.WORLD, out)
-    dist.destroy_process_group()
 
 
 @pytest.mark.multi_gpu

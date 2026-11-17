@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 from contextlib import closing
 from typing import Any, TYPE_CHECKING
@@ -21,6 +20,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 
 import torchpyimpl.distributed.symmetric_memory as symm
 import torchpyimpl.distributed.symmetric_memory._symm_mem as sm
@@ -36,23 +36,6 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _init(rank: int, world_size: int, port: int, backend: str) -> torch.device:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    symm.set_backend(backend)
-    return device
-
-
 def _rejected_in_capture(fn: Callable[[], object], stream: torch.cuda.Stream) -> str:
     graph = torch.cuda.CUDAGraph()
     try:
@@ -63,10 +46,10 @@ def _rejected_in_capture(fn: Callable[[], object], stream: torch.cuda.Stream) ->
     return ""
 
 
-def _capture_worker(
-    rank: int, world_size: int, port: int, out: str, backend: str
-) -> None:
-    device = _init(rank, world_size, port, backend)
+@dist_worker
+def _capture_worker(rank: int, world_size: int, out: str, backend: str) -> None:
+    device = torch.device(f"cuda:{rank}")
+    symm.set_backend(backend)
     pg = dist.group.WORLD
     peer = (rank + 1) % world_size
     t = symm.empty(_N, dtype=torch.float32, device=device)
@@ -77,7 +60,6 @@ def _capture_worker(
     with torch.cuda.stream(stream):
         hdl.barrier()
     torch.cuda.synchronize()
-
     r: dict[str, Any] = {"rank": rank}
     r["alloc"] = _rejected_in_capture(
         lambda: symm.empty(1 << 22, device=device), stream
@@ -86,7 +68,6 @@ def _capture_worker(
     r["first_rendezvous"] = _rejected_in_capture(
         lambda: symm.rendezvous(fresh, pg), stream
     )
-
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         cached = symm.rendezvous(t, pg)
@@ -100,18 +81,15 @@ def _capture_worker(
     torch.cuda.synchronize()
     got = symm.get_buffer(hdl, peer, (_N,), torch.float32)
     r["replayed_peer_value_ok"] = bool((got == peer + 100.0).all())
-
     symm.rendezvous(fresh, pg).barrier()
     torch.cuda.synchronize()
     r["fresh_rendezvous_after"] = True
-
     gathered: list[Any] = [None] * world_size
     dist.all_gather_object(gathered, r, group=pg)
     if rank == 0:
         with open(out, "w") as f:
             json.dump({"reports": gathered}, f)
     dist.barrier()
-    dist.destroy_process_group()
 
 
 @pytest.mark.multi_gpu
