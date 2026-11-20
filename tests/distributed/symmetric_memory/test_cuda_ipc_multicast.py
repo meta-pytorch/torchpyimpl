@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for the CUDA-IPC backend's multicast (multimem) setup and teardown."""
-
 from __future__ import annotations
 
 import json

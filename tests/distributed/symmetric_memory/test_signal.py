@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for the signal-pad kernels and their host-side argument checks."""
-
 from __future__ import annotations
 
 import re

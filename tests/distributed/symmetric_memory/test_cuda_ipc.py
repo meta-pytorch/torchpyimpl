@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for the CUDA-IPC backend and the backend registry."""
-
 from __future__ import annotations
 
 import os

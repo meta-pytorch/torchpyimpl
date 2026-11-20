@@ -4,11 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Multimem kernels (CuTeDSL): barrier and fill through a multicast address.
-
-Multicast addresses are accessible only through ``multimem.*`` instructions.
-"""
-
 from __future__ import annotations
 
 import struct

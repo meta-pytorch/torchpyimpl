@@ -4,12 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CUDA driver wrappers (``cuda.bindings.driver``).
-
-``cu_memset_d8`` does not go through the CUDA caching allocator, so it is safe
-inside MemPool allocator callbacks.
-"""
-
 from __future__ import annotations
 
 import functools

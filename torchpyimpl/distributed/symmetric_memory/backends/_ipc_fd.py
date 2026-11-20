@@ -4,12 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""POSIX fd all-gather for CUDA-IPC ``POSIX_FILE_DESCRIPTOR`` handles.
-
-Each rank binds an ``AF_UNIX`` datagram socket; fds then travel around a ring
-with ``SCM_RIGHTS`` in ``world_size - 1`` steps. Single node only.
-"""
-
 from __future__ import annotations
 
 import array
