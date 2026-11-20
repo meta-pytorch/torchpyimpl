@@ -4,12 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Symmetric memory, modeled on torch.distributed._symmetric_memory.
-
-The accessors are module functions that take a handle. The signal-pad
-operations (barrier, put_signal, wait_signal) are handle methods, as in torch.
-"""
-
 from torchpyimpl.distributed.symmetric_memory._api import (
     empty,
     free_pool,

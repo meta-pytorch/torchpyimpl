@@ -4,76 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Benchmark: one symm-mem configuration, one run.
-
-Times a single (backend, implementation) pair and prints one table. For the
-four-way comparison — torch CUDASymmetricMemory, torchpyimpl CUDA-IPC, torchpyimpl
-NCCL, torch NCCLSymmetricMemory — use ``compare.sh``, which invokes this script
-once per configuration. Separate processes are deliberate: see that script.
-
-``--backend {NCCL,CUDA}`` picks the symmetric-memory backend, ``--measure``
-picks what is timed in it:
-
-    ours    torchpyimpl (default)
-    torch   torch's native symm-mem for the matching backend
-    both    both in one process, printing a side-by-side ratio
-
-``both`` is the only mode where the two share a process. The ratio is valid, but
-on the NCCL backend torch and torchpyimpl register windows on the same borrowed
-communicator and contend, so the absolutes inflate — use separate runs when the
-absolute numbers matter.
-
-Three sweeps:
-
-* **rendezvous (cached)** — always run. A cache-hit rendezvous: no collective, no
-  device work, so this measures interpreter cost. This is the production path.
-* **alloc** (``--with-alloc-sweeps``) — one allocate per iteration:
-  ``ncclMemAlloc`` on NCCL, ``cuMemCreate`` on CUDA-IPC, ``empty`` for torch.
-  Every tensor is held, so each iteration is a pool miss. The frees run after
-  the timed loop.
-* **rendezvous (cold)** (``--with-alloc-sweeps``) — allocate + rendezvous each
-  iteration, so the cross-rank step fires every time; the frees run after the
-  timed loop. **The alloc is inside this measurement** — subtract the alloc row
-  to isolate the rendezvous.
-
-The alloc sweeps are off by default: they churn the symmetric allocator on a live
-comm and can trigger a non-deterministic NCCL illegal access on some builds. They
-also need every rank to finish allocating before any rank frees, or NCCL's
-symmetric allocator faults; a barrier after the timed loop does this, outside
-the reported time.
-
-Timing:
-
-* Wall clock via ``time.perf_counter_ns`` — CUDA events cannot time Python and
-  pybind work, which is most of what is under test.
-* **p20/p50/p80**, not mean +/- stdev: host-side distributions are heavy-tailed.
-* Cached is **auto-sized** — estimate one iteration, then derive warmup and
-  repeat counts from a 25 ms / 100 ms budget. Alloc and cold use a **fixed** 3
-  warmup / 10 timed; at ~100 ms an iteration a time budget is unusable.
-* ``host_only`` on the cached sweep skips the per-iteration ``cuda.synchronize``
-  (~1 us, comparable to the value being measured, and there is no device work to
-  synchronize with).
-* A ``dist.barrier`` precedes every alloc and cold iteration, keeping one
-  iteration's teardown skew out of the next.
-
-Output: raw per-rank JSON under ``$TORCHPYIMPL_BENCH_DIR`` (default
-``/tmp/torchpyimpl-bench``), named for backend, what was measured, sweeps, world
-size and timestamp, with the path printed as the last line. The console table
-shows rank 0 only; the JSON carries every rank.
-
-Usage::
-
-    ./benchmarks/symmetric_memory/compare.sh --with-alloc-sweeps   # 4-way comparison
-    python benchmarks/symmetric_memory/bench.py          # torchpyimpl CUDA, cached
-    python benchmarks/symmetric_memory/bench.py --backend CUDA --measure torch
-    python benchmarks/symmetric_memory/bench.py --backend CUDA --with-alloc-sweeps --max-log2 33
-
-Buffer sizes sweep powers of two (``--min-log2`` .. ``--max-log2``, default 4 KiB
-.. 1 GiB); alloc and cold also print a ``GB/s`` setup-throughput column.
-``--world-size`` sets the rank count (default: all visible GPUs, capped at 8);
-``compare.sh`` drives a sweep of them via ``RANKS``.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -537,7 +467,7 @@ def _print_table(reports: list[dict]) -> None:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--measure",
         choices=[OURS, TORCH, BOTH],

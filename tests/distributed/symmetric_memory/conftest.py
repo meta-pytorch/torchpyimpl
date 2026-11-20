@@ -4,13 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Skip symmetric memory tests on hosts that lack the hardware they need.
-
-The probes try the operation rather than read device attributes: a GPU can
-report fabric handle support on a host with no IMEX channel, where
-``cuMemCreate`` then fails with ``CUDA_ERROR_NOT_PERMITTED``.
-"""
-
 from __future__ import annotations
 
 import functools

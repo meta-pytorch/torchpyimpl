@@ -4,13 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Signal-pad kernels (CuTeDSL): ``barrier``, ``put_signal``, ``wait_signal``.
-
-Slot for ``src -> dst`` on ``channel``: ``dst_pad[channel * world_size + src]``.
-Send is ``CAS(0 -> 1)`` (release, sys); wait is ``CAS(1 -> 0)`` (acquire, sys).
-With ``timeout_ms > 0`` a spin traps past its deadline.
-"""
-
 from __future__ import annotations
 
 from functools import cache

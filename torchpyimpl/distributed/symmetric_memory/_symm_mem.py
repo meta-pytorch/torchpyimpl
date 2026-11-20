@@ -4,14 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Backend-agnostic symmetric-memory allocator.
-
-Each allocation is ``[signal pad | data buffer]``; ``alloc`` returns the data
-pointer, ``buffer_offset`` bytes past the base. Backends implement
-``alloc_physical``, ``free_physical``, ``allocation_base``, ``establish_peers``
-and ``close_peers``.
-"""
-
 from __future__ import annotations
 
 import logging
