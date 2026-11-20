@@ -95,7 +95,8 @@ count as an arrival, and a later `wait_signal` would never see its value.
   (`ncclCommAbort`) cannot touch a thread spinning on a raw peer pointer anyway.
   Unbounded, a missing peer wedges the device until the process is killed. So
   `timeout_ms=None` (the default) uses the handle's group timeout (unbounded if
-  the group's backend exposes none); `0` is unbounded, as in torch. A thread
+  the group's backend exposes none, or once the group is destroyed); `0` is
+  unbounded, as in torch. A thread
   past the deadline traps — an
   unrecoverable CUDA error on the host's next sync, with the pad left
   mid-handshake. The deadline uses `%globaltimer` (real nanoseconds) rather than

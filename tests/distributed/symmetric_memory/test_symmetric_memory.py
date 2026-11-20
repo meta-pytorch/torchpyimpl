@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import datetime
+import gc
 import json
 import os
 import socket
@@ -24,6 +26,7 @@ from cuda.bindings import driver
 
 import torchpyimpl.distributed.symmetric_memory as symm
 import torchpyimpl.distributed.symmetric_memory._symm_mem as sm
+from torchpyimpl.distributed.symmetric_memory import _api as api
 from torchpyimpl.distributed.symmetric_memory._comm import get_group_info
 from torchpyimpl.distributed.symmetric_memory._cuda import (
     cu_mem_get_address_range,
@@ -469,6 +472,54 @@ def test_sliced_handle_accessors(tmp_path: pathlib.Path) -> None:
         assert r["negative_offset_rejected"], f"rank {rank}: negative offset accepted"
         assert r["group_name_ok"], f"rank {rank}: rendezvous by group name failed"
         assert r["pad_defaults_ok"], f"rank {rank}: wrong default signal pad view"
+
+
+def _group_name_worker(rank: int, world_size: int, port: int, out: str) -> None:
+    device = _init_dist(rank, world_size, port)
+    pg_a = dist.new_group(ranks=list(range(world_size)))
+    pg_b = dist.new_group(
+        ranks=list(range(world_size)), timeout=datetime.timedelta(seconds=7)
+    )
+    solo = dist.new_group(ranks=[0])
+    t = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
+    hdl_world = symm.rendezvous(t, dist.group.WORLD)
+    hdl_a = symm.rendezvous(t, pg_a)
+    hdl_b = symm.rendezvous(t, pg_b.group_name)
+    r: dict[str, Any] = {
+        "rank": rank,
+        "world": hdl_world.group_name == dist.group.WORLD.group_name,
+        "a": hdl_a.group_name == pg_a.group_name,
+        "b": hdl_b.group_name == pg_b.group_name,
+        "distinct": len({h.group_name for h in (hdl_world, hdl_a, hdl_b)}) == 3,
+        "b_timeout_ms": api._resolve_timeout(hdl_b, None),
+    }
+    if rank == 0:
+        hdl_solo = symm.rendezvous(t, solo)
+        r["solo"] = (hdl_solo.group_name, hdl_solo.world_size) == (
+            solo.group_name,
+            1,
+        )
+    dist.destroy_process_group(pg_b)
+    del pg_b
+    gc.collect()
+    r["b_timeout_after_destroy_ms"] = api._resolve_timeout(hdl_b, None)
+    _gather_reports(r, dist.group.WORLD, out)
+    dist.destroy_process_group()
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.peer_access
+def test_handle_reports_its_group(tmp_path: pathlib.Path) -> None:
+    world_size = min(torch.cuda.device_count(), 8)
+    reports = _spawn(_group_name_worker, world_size, str(tmp_path / "reports.json"))
+    assert len(reports) == world_size
+    for r in reports:
+        rank = r["rank"]
+        assert r["world"] and r["a"] and r["b"], f"rank {rank}: wrong group_name"
+        assert r["distinct"], f"rank {rank}: handles of distinct groups share a name"
+        assert r["b_timeout_ms"] == 7000, rank
+        assert r["b_timeout_after_destroy_ms"] == 0, rank
+    assert reports[0]["solo"], "a single-rank subgroup handle has the wrong group"
 
 
 def _empty_device_worker(rank: int, result_path: str) -> None:

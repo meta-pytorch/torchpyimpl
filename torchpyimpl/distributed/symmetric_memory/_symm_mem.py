@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import weakref
 from dataclasses import dataclass, field
 from enum import auto, Enum
 
 import torch
+import torch.distributed as dist
 
 from torchpyimpl.distributed.symmetric_memory import _allocator
 from torchpyimpl.distributed.symmetric_memory._cuda import (
@@ -132,6 +134,11 @@ class SymmMemHandle:
     world_size: int
     comm_ptr: int
     data_ptr: int = 0
+    group_name: str = ""
+    group_ref: weakref.ref[dist.ProcessGroup] | None = field(
+        default=None, repr=False, compare=False
+    )
+    group_timeout_ms: int = 0
 
     def barrier(self, channel: int = 0, timeout_ms: int | None = None) -> None:
         from torchpyimpl.distributed.symmetric_memory import _api
@@ -402,6 +409,7 @@ class SymmetricMemoryAllocatorBase:
         device: torch.device,
         size: int | None = None,
         group: object | None = None,
+        timeout_ms: int = 0,
     ) -> SymmMemHandle:
         rec, offset = self.find_covering(buffer_ptr)
         if rec is None:
@@ -445,7 +453,16 @@ class SymmetricMemoryAllocatorBase:
                 pai = self.establish_peers(rec, comm_ptr, world_size, device, group)
                 rec.per_comm[comm_ptr] = pai
             handle = self._make_handle(
-                rec, pai, buffer_ptr, offset, comm_ptr, rank, world_size, size
+                rec,
+                pai,
+                buffer_ptr,
+                offset,
+                comm_ptr,
+                rank,
+                world_size,
+                size,
+                group,
+                timeout_ms,
             )
             with self._lock:
                 if rec.retired:
@@ -472,8 +489,11 @@ class SymmetricMemoryAllocatorBase:
         rank: int,
         world_size: int,
         size: int | None,
+        group: object | None,
+        timeout_ms: int,
     ) -> SymmMemHandle:
         multicast_ptr = pai.multicast_ptr + offset if pai.multicast_ptr != 0 else 0
+        pg = group if isinstance(group, dist.ProcessGroup) else None
         return SymmMemHandle(
             buffer_ptr=pai.buffers[rank] + offset,
             signal_pad_ptr=pai.signal_pads[rank],
@@ -490,6 +510,9 @@ class SymmetricMemoryAllocatorBase:
             world_size=world_size,
             comm_ptr=comm_ptr,
             data_ptr=data_ptr,
+            group_name="" if pg is None else pg.group_name,
+            group_ref=None if pg is None else weakref.ref(pg),
+            group_timeout_ms=timeout_ms,
         )
 
     def cache_stats(self) -> dict[str, int]:
