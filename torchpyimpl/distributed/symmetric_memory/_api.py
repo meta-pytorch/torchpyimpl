@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import logging
-import weakref
 
 import torch
 import torch.distributed as dist
@@ -19,7 +18,7 @@ from torchpyimpl.distributed.symmetric_memory import (
     _signal,
     _symm_mem,
 )
-from torchpyimpl.distributed.symmetric_memory._comm import get_group_info, GroupInfo
+from torchpyimpl.distributed.symmetric_memory._comm import get_group_info
 from torchpyimpl.distributed.symmetric_memory._symm_mem import (
     barrier_state_offset,
     signal_pad_bytes,
@@ -78,7 +77,6 @@ def rendezvous(
     device = tensor.device
     allocator = _symm_mem.get_allocator_instance()
     info = get_group_info(group, device, require_comm=allocator.requires_nccl_comm)
-    _remember_group_timeout(info, group)
     return allocator.rendezvous(
         int(tensor.data_ptr()),
         info.comm_ptr,
@@ -86,14 +84,8 @@ def rendezvous(
         info.world_size,
         device,
         group=group,
+        timeout_ms=info.timeout_ms,
     )
-
-
-_group_timeout_ms: dict[int, tuple[int, weakref.ref[dist.ProcessGroup]]] = {}
-
-
-def _remember_group_timeout(info: GroupInfo, group: dist.ProcessGroup) -> None:
-    _group_timeout_ms[info.comm_ptr] = (info.timeout_ms, weakref.ref(group))
 
 
 def _resolve_timeout(handle: _symm_mem.SymmMemHandle, timeout_ms: int | None) -> int:
@@ -101,14 +93,9 @@ def _resolve_timeout(handle: _symm_mem.SymmMemHandle, timeout_ms: int | None) ->
         if timeout_ms < 0:
             raise ValueError(f"timeout_ms must be >= 0 or None, got {timeout_ms}")
         return timeout_ms
-    entry = _group_timeout_ms.get(handle.comm_ptr)
-    if entry is None:
+    if handle.group_ref is None or handle.group_ref() is None:
         return 0
-    ms, group_ref = entry
-    if group_ref() is None:
-        del _group_timeout_ms[handle.comm_ptr]
-        return 0
-    return ms
+    return handle.group_timeout_ms
 
 
 def free_pool(

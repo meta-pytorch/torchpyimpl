@@ -61,6 +61,10 @@ Both converge on the same allocator and the same handle.
 | `put_signal(dst_rank, channel=0, timeout_ms=None)` | raise this rank's slot in `dst_rank`'s pad |
 | `wait_signal(src_rank, channel=0, timeout_ms=None)` | wait for `src_rank`'s signal, then reset the slot |
 
+The handle also carries `group_name`, the group it was rendezvoused on, as
+torch's `hdl.group_name`. A buffer rendezvoused on two groups has two handles,
+one per group. The handle holds its group weakly.
+
 ## The handle contract
 
 | accessor | returns | offset convention |
