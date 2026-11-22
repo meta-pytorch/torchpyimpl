@@ -1,0 +1,55 @@
+[[linter]]
+code = 'PYFMT'
+include_patterns = [
+    'torchpyimpl/**/*.py',
+    'torchpyimpl/**/*.pyi',
+    'tests/**/*.py',
+    'benchmarks/**/*.py',
+    'tools/**/*.py',
+    'conftest.py',
+]
+command = [
+    'uv',
+    'run',
+    '--script',
+    'tools/linter/adapters/pyfmt_linter.py',
+    '--',
+    '@{{PATHSFILE}}'
+]
+is_formatter = true
+
+[[linter]]
+code = 'RUFF'
+include_patterns = [
+    '**/*.py',
+    '**/*.pyi',
+    'pyproject.toml',
+]
+exclude_patterns = [
+    'stubs/**',
+]
+command = [
+    'uv',
+    'run',
+    '--script',
+    'tools/linter/adapters/ruff_linter.py',
+    '--config=pyproject.toml',
+    '--show-disable',
+    '--',
+    '@{{PATHSFILE}}'
+]
+is_formatter = true
+
+[[linter]]
+code = 'PYREFLY'
+include_patterns = [
+    'torchpyimpl/**/*.py',
+    'torchpyimpl/**/*.pyi',
+]
+command = [
+    'uv',
+    'run',
+    '--script',
+    'tools/linter/adapters/pyrefly_linter.py',
+    '--config=pyrefly.toml',
+]
