@@ -1,0 +1,41 @@
+name: Bug report
+description: Report incorrect behavior, a crash or a hang.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Tell us what is wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest script or test that shows the problem. Include the command that you use to start it.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full error message and traceback.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Paste the output of `python -m torch.utils.collect_env` and `nvidia-smi`. Give the torchpyimpl version or commit.
+      render: shell
+    validations:
+      required: true
