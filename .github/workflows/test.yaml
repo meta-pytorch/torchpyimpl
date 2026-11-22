@@ -6,6 +6,9 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   cpu-test:
     if: github.repository_owner == 'meta-pytorch'
