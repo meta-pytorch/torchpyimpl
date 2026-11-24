@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
+import tempfile
 from contextlib import closing
 from typing import Any, TYPE_CHECKING
 
@@ -66,7 +68,7 @@ def _worker(rank: int, world_size: int, port: int, tmp: str, result_path: str) -
             "others_none": others_none,
             "leftover_sockets": [
                 p
-                for p in os.listdir(os.path.dirname(_ipc_fd._socket_path()))
+                for p in os.listdir(tempfile.gettempdir())
                 if p.startswith(f"torchpyimpl-{os.getpid()}-")
             ],
         }
@@ -108,9 +110,9 @@ def _failure_worker(rank: int, world_size: int, port: int, result_path: str) -> 
             recv_fd = _ipc_fd._recv_fd
             calls = [0]
 
-            def recv_then_fail(sock: socket.socket) -> int | None:
+            def recv_then_fail(sock: socket.socket, src_path: str) -> int | None:
                 calls[0] += 1
-                fd = recv_fd(sock)
+                fd = recv_fd(sock, src_path)
                 if calls[0] == world_size - 1:
                     raise RuntimeError("injected receive failure")
                 return fd
@@ -155,3 +157,57 @@ def test_single_rank_returns_local_fd() -> None:
 @pytest.mark.parametrize("fds", [[], [None], [None, None]])
 def test_close_fds_ignores_none(fds: list[int | None]) -> None:
     _ipc_fd.close_fds(fds)
+
+
+def test_socket_dir_is_private_under_permissive_umask() -> None:
+    old_umask = os.umask(0)
+    try:
+        sock, sock_dir = _ipc_fd._bind_socket()
+    finally:
+        os.umask(old_umask)
+    try:
+        st = os.stat(sock_dir)
+        assert stat.S_IMODE(st.st_mode) == 0o700
+        assert st.st_uid == os.getuid()
+        assert os.path.dirname(sock.getsockname()) == sock_dir
+    finally:
+        sock.close()
+        _ipc_fd._remove_dir(sock_dir)
+    assert not os.path.exists(sock_dir)
+
+
+def _open_fd_count() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_recv_fd_rejects_unexpected_sender_and_closes_its_fd() -> None:
+    bound = [_ipc_fd._bind_socket() for _ in range(3)]
+    receiver, peer, intruder = (s for s, _ in bound)
+    try:
+        fd = os.open(os.devnull, os.O_RDONLY)
+        _ipc_fd._send_fd(intruder, receiver.getsockname(), fd)
+        os.close(fd)
+        before = _open_fd_count()
+        with pytest.raises(RuntimeError, match="expected the previous rank"):
+            _ipc_fd._recv_fd(receiver, peer.getsockname())
+        assert _open_fd_count() == before
+
+        _ipc_fd._send_fd(peer, receiver.getsockname(), None)
+        assert _ipc_fd._recv_fd(receiver, peer.getsockname()) is None
+    finally:
+        for sock, sock_dir in bound:
+            sock.close()
+            _ipc_fd._remove_dir(sock_dir)
+
+
+def test_recv_fd_rejects_unexpected_payload() -> None:
+    bound = [_ipc_fd._bind_socket() for _ in range(2)]
+    receiver, peer = (s for s, _ in bound)
+    try:
+        peer.sendto(b"xyz", receiver.getsockname())
+        with pytest.raises(RuntimeError, match="unexpected payload"):
+            _ipc_fd._recv_fd(receiver, peer.getsockname())
+    finally:
+        for sock, sock_dir in bound:
+            sock.close()
+            _ipc_fd._remove_dir(sock_dir)

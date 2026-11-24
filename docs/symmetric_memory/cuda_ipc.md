@@ -102,13 +102,21 @@ install a *new* fd for the same open file in the receiver.
 `torchpyimpl/distributed/symmetric_memory/backends/_ipc_fd.py` builds an all-gather out of that:
 
 ```
-  every rank binds an AF_UNIX/SOCK_DGRAM socket at a unique path
+  every rank binds an AF_UNIX/SOCK_DGRAM socket in its own 0700 directory
   all_gather_object the paths          (bind first, so every peer is listening)
   ring, world_size - 1 steps:
       send what you currently hold to rank + 1
-      receive rank - k's fd from rank - 1
+      receive rank - k's fd from rank - 1   (reject any other sender)
   all_gather_object an ok flag          (if one rank failed, every rank raises)
 ```
+
+**Only the previous rank can send to a socket.** Each rank binds its socket in
+a new private directory that `tempfile.mkdtemp` makes with mode 0700. Other
+local users cannot send to the socket, whatever their umask is. `_recv_fd` also
+compares the sender address with the socket path of rank - 1. It rejects a
+message from a different sender or with a different payload, and it closes the
+fds that came with that message. Thus all ranks on a node must run as the same
+user.
 
 Two properties make the ring safe. It is **datagram**-based, so every rank sends
 before it receives and the kernel buffers the tiny message — no deadlock, no
