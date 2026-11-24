@@ -17,9 +17,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.9"
       - name: Install dependencies
         run: uv sync --locked
       - name: Test
@@ -28,17 +32,18 @@ jobs:
   gpu-test:
     if: github.repository_owner == 'meta-pytorch'
     name: GPU tests
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@e74130a356eb17e3431571bc3af15c20ba88b6e6
     permissions:
       id-token: write
       contents: read
     with:
+      test-infra-ref: e74130a356eb17e3431571bc3af15c20ba88b6e6
       timeout: 60
       runner: linux.g5.12xlarge.nvidia.gpu
       gpu-arch-type: cuda
       gpu-arch-version: "13.0"
       script: |
         set -ex
-        pip install uv
+        pip install uv==0.13.9
         uv sync --locked
         uv run pytest tests/ -v -rs
