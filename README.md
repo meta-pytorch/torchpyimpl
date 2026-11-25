@@ -18,9 +18,28 @@ Design notes: [`docs/symmetric_memory`](docs/symmetric_memory/README.md).
 
 ## Prerequisites
 
+- Linux on x86_64 or aarch64
 - Python 3.12 through 3.14
 - PyTorch nightly
-- CUDA 13 capable NVIDIA GPU
+- NVIDIA GPU with a driver that supports CUDA 13 (R580 or later)
+
+### Hardware support
+
+Each symmetric memory feature needs specific hardware:
+
+| Feature | Hardware |
+|---|---|
+| Peer buffers, `fd` transport | GPUs on one node with peer-to-peer access (NVLink or PCIe) |
+| Peer buffers, `fabric` transport | Fabric-capable GPUs (GB200, GB300, H100 with NVSwitch) and an IMEX channel |
+| Multicast (`multimem`) | GPUs that report `CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED` (NVSwitch systems) |
+
+The backend uses the `fabric` transport when the device supports it. If the
+node has no IMEX channel, set `TORCHPYIMPL_CUDA_IPC_TRANSPORT=fd`. The tests
+skip the cases that need hardware that the node does not have. CI uses A10G
+GPUs, which have no peer-to-peer access and no multicast. Thus, CI skips those
+tests.
+
+Read [`SECURITY.md`](SECURITY.md) for the trust model.
 
 ## Installation
 

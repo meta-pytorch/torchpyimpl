@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: pytorch/test-infra
+    groups:
+      github-actions:
+        patterns:
+          - "*"

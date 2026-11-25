@@ -9,9 +9,9 @@ from __future__ import annotations
 import array
 import logging
 import os
+import shutil
 import socket
 import tempfile
-import uuid
 
 import torch.distributed as dist
 
@@ -20,12 +20,29 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 _RECV_TIMEOUT_S: float = 300.0
 _PAYLOAD: bytes = b"fd"
+_SOCKET_NAME: str = "sock"
 
 
-def _socket_path() -> str:
-    return os.path.join(
-        tempfile.gettempdir(), f"torchpyimpl-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    )
+def _bind_socket() -> tuple[socket.socket, str]:
+    sock_dir = tempfile.mkdtemp(prefix=f"torchpyimpl-{os.getpid()}-")
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(os.path.join(sock_dir, _SOCKET_NAME))
+        sock.settimeout(_RECV_TIMEOUT_S)
+    except BaseException:
+        if sock is not None:
+            sock.close()
+        _remove_dir(sock_dir)
+        raise
+    return sock, sock_dir
+
+
+def _remove_dir(sock_dir: str) -> None:
+    try:
+        shutil.rmtree(sock_dir)
+    except OSError:
+        logger.debug("could not remove ipc socket dir %s", sock_dir)
 
 
 def all_gather_fds(
@@ -39,22 +56,20 @@ def all_gather_fds(
     if world_size == 1:
         return [local_fd]
 
-    path = _socket_path()
     sock: socket.socket | None = None
+    sock_dir = ""
     setup_error: Exception | None = None
-    bound = False
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sock.bind(path)
-        bound = True
-        sock.settimeout(_RECV_TIMEOUT_S)
+        sock, sock_dir = _bind_socket()
     except Exception as e:
         setup_error = e
 
     fds: list[int | None] = [None for _ in range(world_size)]
     try:
         paths: list[str] = [""] * world_size
-        dist.all_gather_object(paths, path if bound else "", group=pg)
+        dist.all_gather_object(
+            paths, sock.getsockname() if sock is not None else "", group=pg
+        )
         if not all(paths):
             if setup_error is not None:
                 raise setup_error
@@ -67,12 +82,13 @@ def all_gather_fds(
 
         fds[rank] = local_fd
         dst = paths[(rank + 1) % world_size]
+        src = paths[(rank - 1) % world_size]
         in_flight = local_fd
         ring_error: Exception | None = None
         try:
             for step in range(1, world_size):
                 _send_fd(sock, dst, in_flight)
-                in_flight = _recv_fd(sock)
+                in_flight = _recv_fd(sock, src)
                 fds[(rank - step) % world_size] = in_flight
         except Exception as e:
             ring_error = e
@@ -92,11 +108,8 @@ def all_gather_fds(
     finally:
         if sock is not None:
             sock.close()
-        if bound:
-            try:
-                os.unlink(path)
-            except OSError:
-                logger.debug("could not unlink ipc socket %s", path)
+        if sock_dir:
+            _remove_dir(sock_dir)
 
 
 def _send_fd(sock: socket.socket, dst_path: str, fd: int | None) -> None:
@@ -108,15 +121,25 @@ def _send_fd(sock: socket.socket, dst_path: str, fd: int | None) -> None:
     sock.sendmsg([_PAYLOAD], ancdata, 0, dst_path)
 
 
-def _recv_fd(sock: socket.socket) -> int | None:
-    _msg, fds, flags, _addr = socket.recv_fds(sock, len(_PAYLOAD), 1)
+def _recv_fd(sock: socket.socket, src_path: str) -> int | None:
+    msg, fds, flags, addr = socket.recv_fds(sock, len(_PAYLOAD), 1)
+    error = ""
     if flags & socket.MSG_CTRUNC:
-        for fd in fds:
-            os.close(fd)
-        raise RuntimeError(
+        error = (
             "SCM_RIGHTS control message truncated during the fd exchange; "
             "the peer's handle was lost in transit"
         )
+    elif addr != src_path:
+        error = (
+            f"fd-exchange message came from {addr!r}, "
+            f"expected the previous rank at {src_path!r}"
+        )
+    elif msg != _PAYLOAD or flags & socket.MSG_TRUNC:
+        error = "fd-exchange message has an unexpected payload"
+    if error:
+        for fd in fds:
+            os.close(fd)
+        raise RuntimeError(error)
     return fds[0] if fds else None
 
 

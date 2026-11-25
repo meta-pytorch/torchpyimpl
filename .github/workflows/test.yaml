@@ -12,33 +12,88 @@ permissions:
 jobs:
   cpu-test:
     if: github.repository_owner == 'meta-pytorch'
-    name: CPU tests
+    name: CPU tests (Python ${{ matrix.python }})
     runs-on: linux.4xlarge
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.9"
       - name: Install dependencies
         run: uv sync --locked
       - name: Test
         run: uv run pytest tests/ -v -m "not gpu and not multi_gpu"
 
+  wheel:
+    if: github.repository_owner == 'meta-pytorch'
+    name: Wheel install
+    runs-on: linux.4xlarge
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.13.9"
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist
+      - name: Install wheel in a clean venv
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/wheel-venv"
+          uv pip install --python "$RUNNER_TEMP/wheel-venv" --pre torch \
+            --index-url https://download.pytorch.org/whl/nightly/cu132
+          uv pip install --python "$RUNNER_TEMP/wheel-venv" dist/*.whl
+      - name: Import the installed package
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/wheel-venv/bin/python" -c "
+          import torchpyimpl.distributed.symmetric_memory as m
+          print(m.__file__)
+          assert '/site-packages/' in m.__file__
+          "
+
+  cpu-tests:
+    if: always() && github.repository_owner == 'meta-pytorch'
+    name: CPU tests
+    needs: [cpu-test, wheel]
+    runs-on: linux.4xlarge
+    timeout-minutes: 5
+    steps:
+      - name: Check results
+        env:
+          CPU_TEST: ${{ needs.cpu-test.result }}
+          WHEEL: ${{ needs.wheel.result }}
+        run: test "$CPU_TEST" = success && test "$WHEEL" = success
+
   gpu-test:
     if: github.repository_owner == 'meta-pytorch'
     name: GPU tests
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@e74130a356eb17e3431571bc3af15c20ba88b6e6
     permissions:
       id-token: write
       contents: read
     with:
+      test-infra-ref: e74130a356eb17e3431571bc3af15c20ba88b6e6
       timeout: 60
       runner: linux.g5.12xlarge.nvidia.gpu
       gpu-arch-type: cuda
       gpu-arch-version: "13.0"
       script: |
         set -ex
-        pip install uv
+        pip install uv==0.13.9
         uv sync --locked
         uv run pytest tests/ -v -rs
