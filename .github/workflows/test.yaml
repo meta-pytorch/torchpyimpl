@@ -82,7 +82,7 @@ jobs:
   gpu-test:
     if: github.repository_owner == 'meta-pytorch'
     name: GPU tests
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@e74130a356eb17e3431571bc3af15c20ba88b6e6
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@c99b5728f295e70c88295ab15c8e08f5278be22a
     permissions:
       id-token: write
       contents: read
