@@ -21,6 +21,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest",
+    "pytest-timeout",
     "lintrunner",
 ]
 
@@ -238,6 +239,7 @@ standard_library = ["typing_extensions"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 120
 markers = [
     "gpu: requires a CUDA GPU",
     "multi_gpu: requires two or more CUDA GPUs",
