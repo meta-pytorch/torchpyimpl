@@ -19,6 +19,7 @@ from torchpyimpl.distributed.symmetric_memory import (
     _symm_mem,
 )
 from torchpyimpl.distributed.symmetric_memory._comm import get_group_info
+from torchpyimpl.distributed.symmetric_memory._stream_order import group_stream_guard
 from torchpyimpl.distributed.symmetric_memory._symm_mem import (
     barrier_state_offset,
     signal_pad_bytes,
@@ -214,7 +215,7 @@ def barrier(
         return
     _check_signal_args(handle, handle.rank, channel, "barrier")
     timeout = _resolve_timeout(handle, timeout_ms)
-    with torch.cuda.device(_handle_device(handle)):
+    with torch.cuda.device(_handle_device(handle)), group_stream_guard(handle):
         if handle.multicast_signal_pad_ptr:
             state = barrier_state_offset()
             _multimem.barrier(
@@ -241,7 +242,7 @@ def put_signal(
     timeout_ms: int | None = None,
 ) -> None:
     _check_signal_args(handle, dst_rank, channel, "put_signal")
-    with torch.cuda.device(_handle_device(handle)):
+    with torch.cuda.device(_handle_device(handle)), group_stream_guard(handle):
         _signal.put_signal(
             handle.signal_pad_ptrs_tensor,
             handle.rank,
@@ -259,7 +260,7 @@ def wait_signal(
     timeout_ms: int | None = None,
 ) -> None:
     _check_signal_args(handle, src_rank, channel, "wait_signal")
-    with torch.cuda.device(_handle_device(handle)):
+    with torch.cuda.device(_handle_device(handle)), group_stream_guard(handle):
         _signal.wait_signal(
             handle.signal_pad_ptrs_tensor,
             handle.rank,
