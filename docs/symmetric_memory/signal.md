@@ -106,6 +106,7 @@ count as an arrival, and a later `wait_signal` would never see its value.
   rank's pad, or a spin on a slot nobody will signal.
 - **Stream-ordered.** All three are ordinary launches on the current stream, so
   they order against surrounding work like any kernel and are safe to capture in
-  a CUDA graph. Rendezvous is not — it is collective and allocates.
+  a CUDA graph. A first rendezvous is not — it is collective and synchronizes
+  the device (see [`api.md`](api.md#cuda-graphs)).
 - **No communicator involvement.** Peer pads are plain device pointers, so this
   works the same on the CUDA-IPC and NCCL backends.
