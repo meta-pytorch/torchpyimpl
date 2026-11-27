@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import gc
 import re
 import time
+import weakref
 from typing import Any
 
 import pytest
@@ -16,7 +18,6 @@ import torch.multiprocessing as mp
 
 import torchpyimpl.distributed.symmetric_memory._symm_mem as sm
 from torchpyimpl.distributed.symmetric_memory import _api as api, _signal
-from torchpyimpl.distributed.symmetric_memory._comm import GroupInfo
 
 
 _SYM = re.compile(r"kernel_cutlass__[A-Za-z0-9_]+")
@@ -65,18 +66,19 @@ def test_timeout_none_uses_the_group_timeout_and_zero_is_unbounded() -> None:
     class _Group:
         pass
 
-    old, new = _Group(), _Group()
+    group = _Group()
     hdl = _dummy_handle(2)
-    api._remember_group_timeout(GroupInfo(hdl.comm_ptr, 0, 2, 1000), old)  # type: ignore[arg-type]
-    api._remember_group_timeout(GroupInfo(hdl.comm_ptr, 0, 2, 5000), new)  # type: ignore[arg-type]
-    try:
-        assert api._resolve_timeout(hdl, None) == 5000
-        assert api._resolve_timeout(hdl, 0) == 0
-        assert api._resolve_timeout(hdl, 7) == 7
-        with pytest.raises(ValueError):
-            api._resolve_timeout(hdl, -1)
-    finally:
-        api._group_timeout_ms.pop(hdl.comm_ptr, None)
+    hdl.group_ref = weakref.ref(group)  # type: ignore[assignment]
+    hdl.group_timeout_ms = 5000
+    assert api._resolve_timeout(hdl, None) == 5000
+    assert api._resolve_timeout(hdl, 0) == 0
+    assert api._resolve_timeout(hdl, 7) == 7
+    with pytest.raises(ValueError):
+        api._resolve_timeout(hdl, -1)
+    del group
+    gc.collect()
+    assert api._resolve_timeout(hdl, None) == 0
+    assert api._resolve_timeout(_dummy_handle(2), None) == 0
 
 
 def _only_symbol(compiled: Any) -> str:
