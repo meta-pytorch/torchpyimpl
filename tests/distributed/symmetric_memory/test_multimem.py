@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import socket
 from contextlib import closing
@@ -21,6 +20,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 
 import torchpyimpl.distributed.symmetric_memory as symm
 from torchpyimpl.distributed.symmetric_memory import _multimem, _signal
@@ -98,98 +98,83 @@ def _ordering_holds(
     return seen == [stamp + p for p in range(world_size)]
 
 
-def _worker(
-    rank: int, world_size: int, master_port: int, result_path: str, backend: str
-) -> None:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(master_port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
+@dist_worker
+def _worker(rank: int, world_size: int, result_path: str, backend: str) -> None:
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    try:
-        symm.set_backend(backend)
-        pg = dist.new_group(ranks=list(range(world_size)))
-        buf = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
-        hdl = symm.rendezvous(buf, pg)
-        has_mc = hdl.multicast_signal_pad_ptr != 0 and symm.has_multicast_support(hdl)
-        flags: list[Any] = [None] * world_size
-        dist.all_gather_object(flags, has_mc, group=pg)
-        report: dict[str, Any] = {"rank": rank, "has_multicast": all(flags)}
-        if not all(flags):
-            symm.free_pool(device)
-            _gather(report, pg, world_size, result_path)
-            return
-
-        calls: dict[str, int] = {"multimem": 0, "cas": 0}
-        real_mm, real_cas = _multimem.barrier, _signal.barrier
-
-        def count_mm(*a: Any, **k: Any) -> None:
-            calls["multimem"] += 1
-            real_mm(*a, **k)
-
-        def count_cas(*a: Any, **k: Any) -> None:
-            calls["cas"] += 1
-            real_cas(*a, **k)
-
-        _multimem.barrier, _signal.barrier = count_mm, count_cas
-        try:
-            dist.barrier(group=pg)
-            report["mc_ordering"] = _ordering_holds(hdl, rank, world_size, 100.0, pg)
-            report["routed_multimem"] = calls["multimem"]
-
-            for _ in range(_ROUNDS):
-                hdl.barrier()
-            torch.cuda.synchronize(device)
-
-            _multimem._compiled_barrier.cache_clear()
-            for ch in range(_CHANNELS):
-                hdl.barrier(channel=ch)
-            torch.cuda.synchronize(device)
-            report["compiles"] = _multimem._compiled_barrier.cache_info().currsize
-
-            dist.barrier(group=pg)
-            if rank == 1:
-                torch.cuda._sleep(_DELAY_CYCLES)
-                hdl.wait_signal(0, timeout_ms=10_000)
-            elif rank == 0:
-                hdl.put_signal(1, timeout_ms=10_000)
-            hdl.barrier(timeout_ms=10_000)
-            torch.cuda.synchronize(device)
-            report["signal_then_barrier_ok"] = True
-
-            mc_pad = hdl.multicast_signal_pad_ptr
-            hdl.multicast_signal_pad_ptr = 0
-            before_cas = calls["cas"]
-            dist.barrier(group=pg)
-            report["cas_ordering"] = _ordering_holds(hdl, rank, world_size, 200.0, pg)
-            report["routed_cas"] = calls["cas"] - before_cas
-            hdl.multicast_signal_pad_ptr = mc_pad
-        finally:
-            _multimem.barrier, _signal.barrier = real_mm, real_cas
-
-        dist.barrier(group=pg)
-        mine = symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32)
-        mine.zero_()
-        torch.cuda.synchronize(device)
-        dist.barrier(group=pg)
-        if rank == 0:
-            _multimem.fill(hdl.multicast_ptr, _N_ELEMS, 7.0)
-            torch.cuda.synchronize(device)
-        dist.barrier(group=pg)
-        report["fill_ok"] = bool(torch.all(mine == 7.0).item())
-
-        dist.barrier(group=pg)
+    symm.set_backend(backend)
+    pg = dist.new_group(ranks=list(range(world_size)))
+    buf = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
+    hdl = symm.rendezvous(buf, pg)
+    has_mc = hdl.multicast_signal_pad_ptr != 0 and symm.has_multicast_support(hdl)
+    flags: list[Any] = [None] * world_size
+    dist.all_gather_object(flags, has_mc, group=pg)
+    report: dict[str, Any] = {"rank": rank, "has_multicast": all(flags)}
+    if not all(flags):
         symm.free_pool(device)
         _gather(report, pg, world_size, result_path)
+        return
+
+    calls: dict[str, int] = {"multimem": 0, "cas": 0}
+    real_mm, real_cas = _multimem.barrier, _signal.barrier
+
+    def count_mm(*a: Any, **k: Any) -> None:
+        calls["multimem"] += 1
+        real_mm(*a, **k)
+
+    def count_cas(*a: Any, **k: Any) -> None:
+        calls["cas"] += 1
+        real_cas(*a, **k)
+
+    _multimem.barrier, _signal.barrier = count_mm, count_cas
+    try:
+        dist.barrier(group=pg)
+        report["mc_ordering"] = _ordering_holds(hdl, rank, world_size, 100.0, pg)
+        report["routed_multimem"] = calls["multimem"]
+
+        for _ in range(_ROUNDS):
+            hdl.barrier()
+        torch.cuda.synchronize(device)
+
+        _multimem._compiled_barrier.cache_clear()
+        for ch in range(_CHANNELS):
+            hdl.barrier(channel=ch)
+        torch.cuda.synchronize(device)
+        report["compiles"] = _multimem._compiled_barrier.cache_info().currsize
+
+        dist.barrier(group=pg)
+        if rank == 1:
+            torch.cuda._sleep(_DELAY_CYCLES)
+            hdl.wait_signal(0, timeout_ms=10_000)
+        elif rank == 0:
+            hdl.put_signal(1, timeout_ms=10_000)
+        hdl.barrier(timeout_ms=10_000)
+        torch.cuda.synchronize(device)
+        report["signal_then_barrier_ok"] = True
+
+        mc_pad = hdl.multicast_signal_pad_ptr
+        hdl.multicast_signal_pad_ptr = 0
+        before_cas = calls["cas"]
+        dist.barrier(group=pg)
+        report["cas_ordering"] = _ordering_holds(hdl, rank, world_size, 200.0, pg)
+        report["routed_cas"] = calls["cas"] - before_cas
+        hdl.multicast_signal_pad_ptr = mc_pad
     finally:
-        dist.destroy_process_group()
+        _multimem.barrier, _signal.barrier = real_mm, real_cas
+
+    dist.barrier(group=pg)
+    mine = symm.get_buffer(hdl, rank, (_N_ELEMS,), torch.float32)
+    mine.zero_()
+    torch.cuda.synchronize(device)
+    dist.barrier(group=pg)
+    if rank == 0:
+        _multimem.fill(hdl.multicast_ptr, _N_ELEMS, 7.0)
+        torch.cuda.synchronize(device)
+    dist.barrier(group=pg)
+    report["fill_ok"] = bool(torch.all(mine == 7.0).item())
+
+    dist.barrier(group=pg)
+    symm.free_pool(device)
+    _gather(report, pg, world_size, result_path)
 
 
 def _gather(report: dict[str, Any], pg: Any, world_size: int, result_path: str) -> None:

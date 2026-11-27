@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 from contextlib import closing
 from typing import Any, TYPE_CHECKING
@@ -20,6 +19,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 
 import torchpyimpl.distributed.symmetric_memory as symm
 from torchpyimpl.distributed.symmetric_memory._symm_mem import (
@@ -37,76 +37,61 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _worker(
-    rank: int, world_size: int, master_port: int, result_path: str, backend: str
-) -> None:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(master_port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
+@dist_worker
+def _worker(rank: int, world_size: int, result_path: str, backend: str) -> None:
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    try:
-        symm.set_backend(backend)
-        pg = dist.new_group(ranks=list(range(world_size)))
+    symm.set_backend(backend)
+    pg = dist.new_group(ranks=list(range(world_size)))
 
-        t = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
-        t.fill_(float(rank + 1))
-        torch.cuda.synchronize(device)
+    t = symm.empty(_N_ELEMS, dtype=torch.float32, device=device)
+    t.fill_(float(rank + 1))
+    torch.cuda.synchronize(device)
 
-        h0 = symm.rendezvous(t, pg)
-        infos_after_first = _cache_stats()["peer_alloc_infos"]
-        cache_identity = symm.rendezvous(t, pg) is h0
-        repeat_no_new_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first
+    h0 = symm.rendezvous(t, pg)
+    infos_after_first = _cache_stats()["peer_alloc_infos"]
+    cache_identity = symm.rendezvous(t, pg) is h0
+    repeat_no_new_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first
 
-        slice_off_elems = 128
-        t_slice = t[slice_off_elems:]
-        h_slice = symm.rendezvous(t_slice, pg)
-        slice_reuses_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first
-        slice_offset_ok = h_slice.offset == slice_off_elems * 4
-        slice_same_base = h_slice.buffer_ptrs[rank] == h0.buffer_ptrs[rank]
+    slice_off_elems = 128
+    t_slice = t[slice_off_elems:]
+    h_slice = symm.rendezvous(t_slice, pg)
+    slice_reuses_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first
+    slice_offset_ok = h_slice.offset == slice_off_elems * 4
+    slice_same_base = h_slice.buffer_ptrs[rank] == h0.buffer_ptrs[rank]
 
-        pg2 = dist.new_group(ranks=list(range(world_size)))
-        h_comm2 = symm.rendezvous(t, pg2)
-        comm2_new_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first + 1
-        comm2_distinct = h_comm2 is not h0 and h_comm2.comm_ptr != h0.comm_ptr
+    pg2 = dist.new_group(ranks=list(range(world_size)))
+    h_comm2 = symm.rendezvous(t, pg2)
+    comm2_new_peers = _cache_stats()["peer_alloc_infos"] == infos_after_first + 1
+    comm2_distinct = h_comm2 is not h0 and h_comm2.comm_ptr != h0.comm_ptr
 
-        handles_before_free = _cache_stats()["handles"]
-        signal_pad_ok = h0.buffer_ptr - h0.signal_pad_ptr == buffer_offset()
-        del t, t_slice, h0, h_slice, h_comm2
-        dist.barrier(group=pg)
-        free_status = symm.free_pool(device, pg).value
+    handles_before_free = _cache_stats()["handles"]
+    signal_pad_ok = h0.buffer_ptr - h0.signal_pad_ptr == buffer_offset()
+    del t, t_slice, h0, h_slice, h_comm2
+    dist.barrier(group=pg)
+    free_status = symm.free_pool(device, pg).value
 
-        report: dict[str, Any] = {
-            "rank": rank,
-            "cache_identity": cache_identity,
-            "repeat_no_new_peers": repeat_no_new_peers,
-            "slice_reuses_peers": slice_reuses_peers,
-            "slice_offset_ok": slice_offset_ok,
-            "slice_same_base": slice_same_base,
-            "comm2_new_peers": comm2_new_peers,
-            "comm2_distinct": comm2_distinct,
-            "handles_before_free": handles_before_free,
-            "free_status": free_status,
-            "infos_after_free": _cache_stats()["peer_alloc_infos"],
-            "handles_after_free": _cache_stats()["handles"],
-            "signal_pad_ok": signal_pad_ok,
-        }
-        gathered: list[Any] = [None] * world_size
-        dist.all_gather_object(gathered, report, group=pg)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump({"reports": gathered}, f)
-        dist.destroy_process_group(pg2)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    report: dict[str, Any] = {
+        "rank": rank,
+        "cache_identity": cache_identity,
+        "repeat_no_new_peers": repeat_no_new_peers,
+        "slice_reuses_peers": slice_reuses_peers,
+        "slice_offset_ok": slice_offset_ok,
+        "slice_same_base": slice_same_base,
+        "comm2_new_peers": comm2_new_peers,
+        "comm2_distinct": comm2_distinct,
+        "handles_before_free": handles_before_free,
+        "free_status": free_status,
+        "infos_after_free": _cache_stats()["peer_alloc_infos"],
+        "handles_after_free": _cache_stats()["handles"],
+        "signal_pad_ok": signal_pad_ok,
+    }
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered, report, group=pg)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump({"reports": gathered}, f)
+    dist.destroy_process_group(pg2)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu

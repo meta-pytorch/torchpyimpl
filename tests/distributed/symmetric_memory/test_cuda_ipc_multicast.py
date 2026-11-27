@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 
 import torchpyimpl.distributed.symmetric_memory._symm_mem as sm
 from torchpyimpl.distributed.symmetric_memory._comm import get_group_info
@@ -84,45 +85,31 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _worker(rank: int, world_size: int, port: int, out: str, transport: str) -> None:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-        TORCHPYIMPL_CUDA_IPC_TRANSPORT=transport,
-    )
-    _cuda_ipc.reset_transport()
+@dist_worker
+def _worker(rank: int, world_size: int, out: str, transport: str) -> None:
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    try:
-        pg = dist.new_group(ranks=list(range(world_size)))
-        comm_ptr = get_group_info(pg, device, require_comm=False).comm_ptr
-        nbytes = 4096
-        buf = sm.alloc(nbytes, device)
-        h = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
-        report: dict[str, Any] = {
-            "rank": rank,
-            "supported": _cuda_ipc.cu_device_supports_multicast(rank),
-            "has_multicast": h.multicast_ptr != 0,
-            "offset_ok": h.multicast_ptr - h.multicast_signal_pad_ptr
-            == sm.buffer_offset(),
-        }
-        dist.barrier(group=pg)
-        sm.free(buf)
-        report["peer_alloc_infos_after_free"] = sm._cache_stats()["peer_alloc_infos"]
-        gathered: list[Any] = [None] * world_size
-        dist.all_gather_object(gathered, report, group=pg)
-        if rank == 0:
-            with open(out, "w") as f:
-                json.dump(gathered, f)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    os.environ["TORCHPYIMPL_CUDA_IPC_TRANSPORT"] = transport
+    _cuda_ipc.reset_transport()
+    pg = dist.new_group(ranks=list(range(world_size)))
+    comm_ptr = get_group_info(pg, device, require_comm=False).comm_ptr
+    nbytes = 4096
+    buf = sm.alloc(nbytes, device)
+    h = sm.rendezvous(buf, nbytes, comm_ptr, rank, world_size, device, group=pg)
+    report: dict[str, Any] = {
+        "rank": rank,
+        "supported": _cuda_ipc.cu_device_supports_multicast(rank),
+        "has_multicast": h.multicast_ptr != 0,
+        "offset_ok": h.multicast_ptr - h.multicast_signal_pad_ptr == sm.buffer_offset(),
+    }
+    dist.barrier(group=pg)
+    sm.free(buf)
+    report["peer_alloc_infos_after_free"] = sm._cache_stats()["peer_alloc_infos"]
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered, report, group=pg)
+    if rank == 0:
+        with open(out, "w") as f:
+            json.dump(gathered, f)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu

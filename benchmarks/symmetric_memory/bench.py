@@ -315,7 +315,7 @@ def _bench_worker(
         try:
             if torch_symm_mem.get_backend(device) != backend:
                 torch_symm_mem.set_backend(backend)
-        except Exception as e:
+        except RuntimeError as e:
             use_torch = False
             measure = OURS
             torch_native_note = (
@@ -325,35 +325,31 @@ def _bench_worker(
     dist.init_process_group(
         backend="nccl", rank=rank, world_size=world_size, device_id=device
     )
-    try:
-        group = dist.group.WORLD
-        if group is None:
-            raise RuntimeError("default process group was not initialized")
-        symm.set_backend(backend)
+    group = dist.group.WORLD
+    if group is None:
+        raise RuntimeError("default process group was not initialized")
+    symm.set_backend(backend)
 
-        results = {
-            "rank": rank,
-            "world_size": world_size,
-            "backend": backend,
-            "with_torch": use_torch,
-            "measure": measure,
-            "torch_native_note": torch_native_note,
-            "free_hbm_gib": torch.cuda.mem_get_info(device)[0] / 2**30,
-            "cached": _run_cached_sweep(group, device, measure, buffer_sizes),
-        }
-        if with_alloc_sweeps:
-            results["alloc"] = _run_alloc_sweep(group, device, measure, buffer_sizes)
-            results["rendezvous"] = _run_cold_sweep(
-                group, device, measure, buffer_sizes
-            )
+    results = {
+        "rank": rank,
+        "world_size": world_size,
+        "backend": backend,
+        "with_torch": use_torch,
+        "measure": measure,
+        "torch_native_note": torch_native_note,
+        "free_hbm_gib": torch.cuda.mem_get_info(device)[0] / 2**30,
+        "cached": _run_cached_sweep(group, device, measure, buffer_sizes),
+    }
+    if with_alloc_sweeps:
+        results["alloc"] = _run_alloc_sweep(group, device, measure, buffer_sizes)
+        results["rendezvous"] = _run_cold_sweep(group, device, measure, buffer_sizes)
 
-        gathered: list = [None] * world_size
-        dist.all_gather_object(gathered, results, group=group)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump({"reports": gathered}, f)
-    finally:
-        dist.destroy_process_group()
+    gathered: list = [None] * world_size
+    dist.all_gather_object(gathered, results, group=group)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump({"reports": gathered}, f)
+    dist.destroy_process_group()
 
 
 def _fmt_ms(p20: float, p50: float, p80: float) -> str:

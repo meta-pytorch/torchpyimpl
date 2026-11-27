@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 import tempfile
 from contextlib import closing
@@ -17,6 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _dist_worker import dist_worker
 
 from torchpyimpl.distributed.symmetric_memory._comm import (
     _synthetic_group_id,
@@ -32,52 +32,37 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _comm_worker(
-    rank: int, world_size: int, master_port: int, result_path: str
-) -> None:
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(master_port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-        LOCAL_RANK=str(rank),
-    )
+@dist_worker
+def _comm_worker(rank: int, world_size: int, result_path: str) -> None:
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size, device_id=device
-    )
-    try:
-        pg = dist.new_group(ranks=list(range(world_size)), backend="nccl")
+    pg = dist.new_group(ranks=list(range(world_size)), backend="nccl")
 
-        p1 = get_nccl_comm_ptr(pg, device)
-        p2 = get_nccl_comm_ptr(pg, device)
-        clear_comm_ptr_cache()
-        p3 = get_nccl_comm_ptr(pg, device)
+    p1 = get_nccl_comm_ptr(pg, device)
+    p2 = get_nccl_comm_ptr(pg, device)
+    clear_comm_ptr_cache()
+    p3 = get_nccl_comm_ptr(pg, device)
 
-        synthetic = get_group_info(pg, device, require_comm=False).comm_ptr
-        p4 = get_nccl_comm_ptr(pg, device)
+    synthetic = get_group_info(pg, device, require_comm=False).comm_ptr
+    p4 = get_nccl_comm_ptr(pg, device)
 
-        dev_index = device.index if device.index is not None else 0
-        other_dev = _synthetic_group_id(pg, dev_index + 1)
+    dev_index = device.index if device.index is not None else 0
+    other_dev = _synthetic_group_id(pg, dev_index + 1)
 
-        report: dict[str, Any] = {
-            "rank": rank,
-            "nonzero": p1 != 0,
-            "memoized": p2 == p1,
-            "reresolved_same": p3 == p1,
-            "synthetic_negative": synthetic < 0,
-            "real_after_synthetic": p4 == p1,
-            "synthetic_per_device": other_dev != synthetic,
-        }
-        gathered: list[Any] = [None] * world_size
-        dist.all_gather_object(gathered, report, group=pg)
-        if rank == 0:
-            with open(result_path, "w") as f:
-                json.dump({"reports": gathered}, f)
-        dist.destroy_process_group(pg)
-    finally:
-        dist.destroy_process_group()
+    report: dict[str, Any] = {
+        "rank": rank,
+        "nonzero": p1 != 0,
+        "memoized": p2 == p1,
+        "reresolved_same": p3 == p1,
+        "synthetic_negative": synthetic < 0,
+        "real_after_synthetic": p4 == p1,
+        "synthetic_per_device": other_dev != synthetic,
+    }
+    gathered: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered, report, group=pg)
+    if rank == 0:
+        with open(result_path, "w") as f:
+            json.dump({"reports": gathered}, f)
+    dist.destroy_process_group(pg)
 
 
 @pytest.mark.multi_gpu

@@ -189,6 +189,9 @@ select = [
     "RUF048", # properly parse `__version__`
     "RUF100", # unused noqa
     "RUF200", # validate pyproject.toml
+    "BLE001", # blind except Exception
+    "S110", # try-except-pass
+    "S112", # try-except-continue
     "S324", # for hashlib FIPS compliance
     "SLOT",
     "TC",
@@ -214,6 +217,10 @@ select = [
 ]
 "tools/linter/**" = [
     "LOG015",
+    "BLE001",
+]
+"torchpyimpl/**" = [
+    "BLE001", # cross-rank error agreement and best-effort cleanup; see CLAUDE.md
 ]
 
 [tool.isort]
