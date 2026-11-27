@@ -13,7 +13,9 @@ jobs:
   lint:
     if: github.repository_owner == 'meta-pytorch'
     name: lintrunner
-    runs-on: linux.4xlarge
+    runs-on: mt-l-x86iavx512-16-128
+    container:
+      image: pytorch/almalinux-builder:cpu
     timeout-minutes: 30
     steps:
       - name: Checkout

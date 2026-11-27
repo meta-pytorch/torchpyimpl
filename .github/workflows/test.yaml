@@ -13,7 +13,9 @@ jobs:
   cpu-test:
     if: github.repository_owner == 'meta-pytorch'
     name: CPU tests (Python ${{ matrix.python }})
-    runs-on: linux.4xlarge
+    runs-on: mt-l-x86iavx512-16-128
+    container:
+      image: pytorch/almalinux-builder:cpu
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -38,7 +40,9 @@ jobs:
   wheel:
     if: github.repository_owner == 'meta-pytorch'
     name: Wheel install
-    runs-on: linux.4xlarge
+    runs-on: mt-l-x86iavx512-16-128
+    container:
+      image: pytorch/almalinux-builder:cpu
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -58,8 +62,9 @@ jobs:
             --index-url https://download.pytorch.org/whl/nightly/cu132
           uv pip install --python "$RUNNER_TEMP/wheel-venv" dist/*.whl
       - name: Import the installed package
-        working-directory: ${{ runner.temp }}
         run: |
+          # runner.temp is the host path, which does not exist in the container.
+          cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/wheel-venv/bin/python" -c "
           import torchpyimpl.distributed.symmetric_memory as m
           print(m.__file__)
@@ -70,7 +75,9 @@ jobs:
     if: always() && github.repository_owner == 'meta-pytorch'
     name: CPU tests
     needs: [cpu-test, wheel]
-    runs-on: linux.4xlarge
+    runs-on: mt-l-x86iavx512-16-128
+    container:
+      image: pytorch/almalinux-builder:cpu
     timeout-minutes: 5
     steps:
       - name: Check results
@@ -82,14 +89,14 @@ jobs:
   gpu-test:
     if: github.repository_owner == 'meta-pytorch'
     name: GPU tests
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@e74130a356eb17e3431571bc3af15c20ba88b6e6
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@a1a8f075de6859c2130f960ed710871b5f99ac19
     permissions:
       id-token: write
       contents: read
     with:
-      test-infra-ref: e74130a356eb17e3431571bc3af15c20ba88b6e6
+      test-infra-ref: a1a8f075de6859c2130f960ed710871b5f99ac19
       timeout: 60
-      runner: linux.g5.12xlarge.nvidia.gpu
+      runner: mt-l-x86aavx2-45-167-a10g-4
       gpu-arch-type: cuda
       gpu-arch-version: "13.0"
       script: |
